@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- CEG Test Projectile Unit written by Steel
+-- CEG Test Projectile Unit written by Steel December 2025
 --
 -- Overview:
 --   This unit definition exists solely to support projectile-based CEG preview

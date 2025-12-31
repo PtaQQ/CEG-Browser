@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- CEG Lookup Helper written by Steel
+-- CEG Lookup Helper written by Steel December 2025
 --
 -- Overview:
 --   This module scans the game's effects directory and builds a lookup table

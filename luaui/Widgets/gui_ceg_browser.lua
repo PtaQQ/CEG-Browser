@@ -1,6 +1,6 @@
 --------------------------------------------------------------------------------
 -- CEG Browser
--- LuaUI Widget for Beyond All Reason made by Steel
+-- LuaUI Widget for Beyond All Reason made by Steel Date: December 2025
 --
 -- Overview:
 --   The CEG Browser is a visual testing and inspection tool for Core Effect
@@ -13,28 +13,37 @@
 --     PROJECTILE mode:
 --       - Fires invisible test projectiles from the mouse ground position
 --       - Selected CEGs are attached as projectile trails
---       - Optional impact CEGs can be assigned per projectile
---       - Direction, pitch, speed, and gravity are adjustable in real time
+--       - Independent Impact and Muzzle CEGs can be assigned
+--       - Direction, pitch, speed, gravity, Time to Live, projectile origin offsets and airburst are adjustable in real time
+--	 - Supports simultaneous Trail / Muzzle / Impact selection
 --
 --     GROUND mode:
 --       - Spawns selected CEGs directly on the ground under the mouse cursor
 --       - Supports line, ring, and scatter spawn patterns
 --       - Spawn count, spacing, and height offset are adjustable
+--       - Intended for testing area effects, environmental CEGs, and ambience
 --
 -- Usage highlights:
---   - Left-click on a CEG: select as Trail
---   - Right-click on a CEG: select as Impact (PROJECTILE mode only)
---     * Right-click has no effect in GROUND mode
+--   - Left-click on a CEG: select as projectile Trail
+--   - Right-click on a CEG: select as Impact (PROJECTILE mode only) * Right-click has no effect in GROUND mode
+--   - Middle-click on a CEG: select Muzzle effect (PROJECTILE mode only) * Middle-click has no effect in GROUND mode
 --   - CTRL + click: multi-select
 --   - CTRL + drag on sliders: fine adjustment (reduced slider sensitivity)
 --   - ALT + hover on CEG list: show full CEG name tooltip
 --   - Search and alphabet filters allow fast navigation of large CEG sets
+
+--     Embedded Tools:
+--       - CEG Forge panel (CEG INFO button)
+--         * Embedded inspection panel, also shows CEG file location
+--         * Opens as a mode-agnostic overlay
+--         * Does not affect browser selection or spawn logic
 --
 -- File dependencies:
 --   This widget is UI-only and relies on the following runtime components:
 --
 --   LuaRules/ceg_lookup.lua
 --     - Provides the authoritative list of available CEG names
+--     - Provides CEG Info panel with selected ceg definition and file location
 --     - Must expose GetAllNames()
 --
 --   LuaRules/Gadgets/game_ceg_preview.lua
@@ -43,15 +52,17 @@
 --     - Handles projectile physics, impact dispatch, and cleanup
 --
 --   units/other/ceg_test_projectile.lua
---     - Helper unit used for projectile-based CEG previews
+--     - Lightweight helper unit used for projectile-based CEG previews
 --     - Defines a lightweight weapon used to emit test projectiles
 --     - Never selectable, controllable, or persistent
 --     - Exists only to carry projectile and impact CEGs during preview
 --
--- Notes:
---   - This widget does NOT modify units, weapons, or CEG definitions
---   - All effects are preview-only and safe to use in live games
---   - Designed to remain layout- and behavior-stable as a tooling baseline
+-- Design Notes:
+--   - This widget never mutates gameplay definitions
+--   - All previews are non-authoritative
+--   - UI rendering, input handling, and spawning are strictly separated
+--   - Filtering, paging, and sorting never destroy user intent
+--   - Intended as a stable tooling baseline for long-term iteration
 --
 --------------------------------------------------------------------------------
 
@@ -62,6 +73,7 @@ function widget:GetInfo()
         name    = "CEG Browser",
         desc    = "In-game browser and preview tool for Core Effect Generators (CEGs)",
         author  = "Steel",
+	date    = "December 2025",
         layer   = 1001,
         enabled = true,
     }
@@ -329,7 +341,7 @@ local function DrawAlphaButton(x0, y0, x1, y1, label, isActive)
     glColor(t.border[1], t.border[2], t.border[3], t.border[4])
     DrawRoundedRectBorder(x0, y0, x1, y1, CORNER_BUTTON_RADIUS, 1)
 
-    local fs = theme.fontSize.normal
+    local fs = theme.fontSize.normal + 2
     local textW = glGetTextWidth(label) * fs
     local tx = x0 + (x1 - x0 - textW) * 0.5
     local ty = y0 + (y1 - y0 - fs) * 0.5 + 1
@@ -346,6 +358,15 @@ local groundArmed = false
 
 local CFG_WIN_X = "ceg_proj_preview_lua_win_x"
 local CFG_WIN_Y = "ceg_proj_preview_lua_win_y"
+
+-- Expose browser rect to companion widgets (e.g. CEG Forge)
+WG.CEGBrowser = WG.CEGBrowser or {}
+
+function WG.CEGBrowser.GetPanelRect()
+    local r = WG.CEGBrowser._lastRect
+    if not r then return end
+    return r[1], r[2], r[3], r[4]
+end
 
 local vsx, vsy
 local winX, winY, winW, winH
@@ -374,6 +395,10 @@ local lastSelected = nil
 local selectedImpactCEGs = {}
 local lastImpactSelected = nil
 
+-- Middle-click (muzzle) selection
+local selectedMuzzleCEGs = {}
+local lastMuzzleSelected = nil
+
 
 local altHoverCEG = nil  -- ALT-hover tooltip state (from baseline)
 local letterFilter  = nil
@@ -382,19 +407,28 @@ local searchFocused = false
 
 -- Projectile tuning
 local yawDeg   = 0     -- -180..180
+local projectileForwardOffset = 0
+local projectileUpOffset      = 0
 local pitchDeg = 20    -- -45..80
-local speedVal = 220   -- 0..600
+local speedVal = 17    -- 0..600
+
+local ttlSeconds = 6    -- 1..30 seconds (default 6)
+local airburstOnTTL = false  -- impact CEG on TTL expiry (airburst)
 
 local gravityVal = 0.16 -- -1.00..+1.00 (default = baseline)
 local tuningVisible = true -- deprecated
 local settingsMode = "projectile"
+    groundArmed = false
 
 -- -----------------------------------------------------------------
 -- CEG Browser settings (merged)
 -- -----------------------------------------------------------------
 local cegPattern    = "line"  -- "line" | "ring" | "scatter"
-local cegSpawnCount = 1       -- 1..100
+local cegSpawnCountF = 1       -- float accumulator for silky CTRL drag
+local cegSpawnCount  = 1       -- 1..100       -- 1..100
 local cegSpacing    = 20      -- 0..128
+
+local cegSpacingF   = 20      -- float accumulator for silky CTRL drag
 local cegHeightOffset = 0      -- 0..800
 local cheatOn       = false
 local globallosOn   = false
@@ -417,6 +451,8 @@ local hitBoxes = {
     sliderPitch  = nil,
     sliderSpeed  = nil,
     sliderGravity = nil,
+    sliderTTL     = nil,
+    btnAirburst = nil,
     -- CEG Browser panel hitboxes
     patternBtns  = {},
     sliderCount  = nil,
@@ -466,25 +502,23 @@ local function RebuildFiltered()
             filteredCEGs[#filteredCEGs+1] = n
         end
     end
-
-    -- Keep only selections still visible (trail + impact)
-local newSel = {}
-local newImp = {}
-for _, n in ipairs(filteredCEGs) do
-    if selectedCEGs[n] then
-        newSel[n] = true
-    end
-    if selectedImpactCEGs[n] then
-        newImp[n] = true
-    end
-end
-selectedCEGs = newSel
-selectedImpactCEGs = newImp
-
-
+    -- NOTE: Do NOT prune selection tables when filters change.
+    -- Filtering/paging is a view concern only; it must not destroy user intent.
+    -- Selected Trail / Impact / Muzzle CEGs may be off-screen/off-filter and should persist.
     local maxPage = math.max(0, math.floor((#filteredCEGs - 1) / ItemsPerPage()))
     pageIndex = Clamp(pageIndex, 0, maxPage)
 end
+
+local function ResolveCEGSourceFile(name)
+    if not name then return nil end
+    local ok, lookup = pcall(VFS.Include, "LuaRules/ceg_lookup.lua")
+    if not ok or not lookup or not lookup.Resolve then
+        return nil
+    end
+    local info = lookup.Resolve(name)
+    return info and info.file
+end
+
 
 --------------------------------------------------------------------------------
 -- Messaging
@@ -544,13 +578,14 @@ end
 
 
 GetSelectedList = function()
+    -- IMPORTANT: selection state must be independent of filtering/paging.
+    -- Iterate selection table directly so selected CEGs spawn even when off-screen/off-filter.
     local list = {}
-    for i = 1, #filteredCEGs do
-        local n = filteredCEGs[i]
-        if selectedCEGs[n] then
-            list[#list+1] = n
-        end
+    for n in pairs(selectedCEGs or {}) do
+        list[#list+1] = n
     end
+    table.sort(list)
+
     -- If none selected but we have a lastSelected, use that
     if #list == 0 and lastSelected then
         list[1] = lastSelected
@@ -559,16 +594,24 @@ GetSelectedList = function()
 end
 
 local function GetImpactSelectedList()
+    -- IMPORTANT: selection state must be independent of filtering/paging.
     local list = {}
-    for i = 1, #filteredCEGs do
-        local n = filteredCEGs[i]
-        if selectedImpactCEGs[n] then
-            list[#list+1] = n
-        end
+    for n in pairs(selectedImpactCEGs or {}) do
+        list[#list+1] = n
     end
+    table.sort(list)
     return list
 end
 
+local function GetMuzzleSelectedList()
+    -- IMPORTANT: selection state must be independent of filtering/paging.
+    local list = {}
+    for n in pairs(selectedMuzzleCEGs or {}) do
+        list[#list+1] = n
+    end
+    table.sort(list)
+    return list
+end
 
 local function FireSelectedProjectiles()
     local mx, my = spGetMouseState()
@@ -602,14 +645,25 @@ local function FireSelectedProjectiles()
     local impactList = GetImpactSelectedList()
     local impactStr  = table.concat(impactList or {}, ",")
 
+    
+    local muzzleList = GetMuzzleSelectedList()
+    local muzzleStr  = table.concat(muzzleList or {}, ",")
+
     local msg = string.format(
-        "%s%s|%s:%d:%d:%d:%d:%d:%.2f",
+        "%s%s:%s:%d:%d:%d:%d:%d:%.2f",
         PREFIX,
         cegName,
         impactStr or "",
         wx, wz, yd, pd, sp, gravityVal
-    )
+    )    msg = msg .. string.format("|ttl=%.2f|airburst=%d", (ttlSeconds or 6), (airburstOnTTL and 1 or 0))
+
+    if muzzleStr ~= "" then
+        msg = msg .. "|muzzle=" .. muzzleStr
+    end
+
+    msg = msg .. string.format("|ofs=%d,%d", math.floor(projectileForwardOffset or 0), math.floor(projectileUpOffset or 0))
     spSendLuaRulesMsg(msg)
+
 
     end
 
@@ -632,7 +686,7 @@ end
 function widget:Initialize()
     vsx, vsy = spGetViewGeometry()
     winW = 420
-    winH = 900
+    winH = 970
 
     local cfgX = spGetConfigInt(CFG_WIN_X, 1)
     local cfgY = spGetConfigInt(CFG_WIN_Y, 1)
@@ -724,6 +778,11 @@ function widget:DrawScreen()
     local x1 = Snap(winX + winW)
     local y1 = Snap(winY + winH)
 
+    -- Expose browser panel rect for companion widgets (e.g. CEG Forge)
+    WG.CEGBrowser = WG.CEGBrowser or {}
+    WG.CEGBrowser._lastRect = { x0, y0, x1, y1 }
+
+
     -- window background
     glColor(theme.window.bg[1], theme.window.bg[2], theme.window.bg[3], theme.window.bg[4])
     DrawRoundedRectFilled(x0, y0, x1, y1, CORNER_WINDOW_RADIUS)
@@ -736,7 +795,7 @@ function widget:DrawScreen()
     DrawRoundedRectFilled(x0+1, y1-titleH, x1-1, y1-1, CORNER_WINDOW_RADIUS-1)
 
     glColor(theme.window.titleText[1], theme.window.titleText[2], theme.window.titleText[3], theme.window.titleText[4])
-    glText("CEG Projectile Preview", x0 + PADDING_OUTER, y1 - titleH + 8, theme.fontSize.title, "o")
+    glText("CEG Browser", x0 + PADDING_OUTER, y1 - titleH + 8, theme.fontSize.title, "o")
 
     ----------------------------------------------------------------
     -- Title buttons
@@ -820,6 +879,9 @@ function widget:DrawScreen()
     local row2Y0 = row2Y1 - cmdBtnH
     local row3Y1 = row2Y0 - 4
     local row3Y0 = row3Y1 - cmdBtnH
+    
+    local row4Y1 = row3Y0 - 4
+    local row4Y0 = row4Y1 - cmdBtnH
 
     local c1x0 = cmdX0
     local c1x1 = cmdX0 + cmdBtnW
@@ -851,7 +913,21 @@ function widget:DrawScreen()
     hitBoxes.topButtons.resetSel = {id="resetSel", x0=c1x0,y0=row3Y0,x1=c1x1,y1=row3Y1}
     hitBoxes.fireBtn             = {id="fire",     x0=c2x0,y0=row3Y0,x1=c2x1,y1=row3Y1}
 
-    local cmdBottom   = row3Y0
+    -- Row 4 (CEG Forge)
+    DrawButton(
+        c1x0, row4Y0, c1x1, row4Y1,
+        "CEG INFO",
+        WG.CEGForge and WG.CEGForge.IsOpen and WG.CEGForge.IsOpen(),
+        false,
+        theme.fontSize.button
+    )
+    hitBoxes.topButtons.forge = {
+        id = "forge",
+        x0 = c1x0, y0 = row4Y0,
+        x1 = c1x1, y1 = row4Y1
+    }
+
+    local cmdBottom   = row4Y0
     local blockBottom = math.min(alphaBottom, cmdBottom)
 
     ----------------------------------------------------------------
@@ -913,12 +989,13 @@ function widget:DrawScreen()
         local tpY1 = searchY0 - 10
 
         -- Panel heights preserved from baselines:
-        --  projectile tuning panel: 164
-        --  CEG browser tuning panel: 110
-        local panelH = (settingsMode == "projectile") and 164 or 130
+        --  projectile tuning panel: 180
+        --  CEG browser tuning panel: 180
+        local panelH = (settingsMode == "projectile") and 210 or 210
         local tpY0 = tpY1 - panelH
         local listTop
 
+        
         if settingsMode == "projectile" then
 
             glColor(theme.tuningPanel.bg[1], theme.tuningPanel.bg[2], theme.tuningPanel.bg[3], theme.tuningPanel.bg[4])
@@ -929,11 +1006,12 @@ function widget:DrawScreen()
             glColor(theme.tuningPanel.text[1], theme.tuningPanel.text[2], theme.tuningPanel.text[3], theme.tuningPanel.text[4])
             glText("Projectile Tuning", Snap(tpX0 + 10), Snap(tpY1 - 22), theme.fontSize.normal, "o")
 
-            local labelX  = tpX0 + 10
-            local LABEL_COL_W = 150
-            local sliderW = 220
+            local labelX   = tpX0 + 10
+            local sliderW  = 170
+            local colGap   = 40
+            local col2X    = labelX + sliderW + colGap
 
-            local function drawSlider(x0s, yMid, val, minVal, maxVal)
+            local function drawPSlider(x0s, yMid, val, minVal, maxVal)
                 local tY0 = yMid-3
                 local tY1 = yMid+3
                 local x1s = x0s+sliderW
@@ -957,56 +1035,118 @@ function widget:DrawScreen()
                 return {x0=x0s,y0=tY0-4,x1=x1s,y1=tY1+4}
             end
 
-            local row1Y = tpY1 - 48
-            glText(string.format("Direction: %d°", math.floor(yawDeg)), Snap(labelX), Snap(row1Y+10), theme.fontSize.normal, "o")
-            hitBoxes.sliderYaw = drawSlider(labelX + LABEL_COL_W, row1Y + 12, yawDeg, -180, 180)
+            local row1LabelY = tpY1 - 40
+            glText(string.format("Direction: %d°", math.floor(yawDeg)), Snap(labelX), Snap(row1LabelY), theme.fontSize.normal, "o")
+            hitBoxes.sliderYaw = drawPSlider(labelX, row1LabelY-10, yawDeg, -180, 180)
 
-            local row2Y = row1Y - 34
-            glText(string.format("Pitch: %d°", math.floor(pitchDeg)), Snap(labelX), Snap(row2Y+10), theme.fontSize.normal, "o")
-            hitBoxes.sliderPitch = drawSlider(labelX + LABEL_COL_W, row2Y + 12, pitchDeg, -45, 80)
+            glText(string.format("Pitch: %d°", math.floor(pitchDeg)), Snap(col2X), Snap(row1LabelY), theme.fontSize.normal, "o")
+            hitBoxes.sliderPitch = drawPSlider(col2X, row1LabelY-10, pitchDeg, -45, 80)
 
-            local row3Y = row2Y - 34
-            glText(string.format("Speed: %d", math.floor(speedVal)), Snap(labelX), Snap(row3Y+10), theme.fontSize.normal, "o")
-            hitBoxes.sliderSpeed = drawSlider(labelX + LABEL_COL_W, row3Y + 12, speedVal, 0, 600)
+            local row2LabelY = row1LabelY - 30
+            glText(string.format("Speed: %d", math.floor(speedVal)), Snap(labelX), Snap(row2LabelY), theme.fontSize.normal, "o")
+            hitBoxes.sliderSpeed = drawPSlider(labelX, row2LabelY-10, speedVal, 0, 600)
+
+            glText(string.format("Gravity: %.2f", gravityVal), Snap(col2X), Snap(row2LabelY), theme.fontSize.normal, "o")
+            hitBoxes.sliderGravity = drawPSlider(col2X, row2LabelY-10, gravityVal, -1.0, 1.0)
+
+            -- Third row: Origin offsets (elmos)
+            local row3LabelY = row2LabelY - 30
+
+            glText(
+                string.format("Origin Forward Offset: %d", math.floor(projectileForwardOffset)),
+                Snap(labelX),
+                Snap(row3LabelY),
+                theme.fontSize.normal,
+                "o"
+            )
+            hitBoxes.sliderProjForward = drawPSlider(
+                labelX,
+                row3LabelY - 10,
+                projectileForwardOffset,
+                0, 100
+            )
+
+            glText(
+                string.format("Origin Height Offset: %d", math.floor(projectileUpOffset)),
+                Snap(col2X),
+                Snap(row3LabelY),
+                theme.fontSize.normal,
+                "o"
+            )
+            hitBoxes.sliderProjUp = drawPSlider(
+                col2X,
+                row3LabelY - 10,
+                projectileUpOffset,
+                0, 100
+            )
+
+            -- Fourth row: Time To Live (seconds)
+            local row4LabelY = row3LabelY - 30
+            glText(
+                string.format("Time To Live: %.1fs", ttlSeconds),
+                Snap(labelX),
+                Snap(row4LabelY),
+                theme.fontSize.normal,
+                "o"
+            )
+            hitBoxes.sliderTTL = drawPSlider(
+                labelX,
+                row4LabelY - 10,
+                ttlSeconds,
+                1, 30
+            )
 
 
-            local row4Y = row3Y - 34
-            glText(string.format("Gravity: %.2f", gravityVal), Snap(labelX), Snap(row4Y+10), theme.fontSize.normal, "o")
-            hitBoxes.sliderGravity = drawSlider(labelX + LABEL_COL_W, row4Y + 12, gravityVal, -1.0, 1.0)
+            -- Airburst toggle (Impact CEG at TTL expiry)
+            local abW, abH = 170, 18
+            local abX0 = col2X
+            local abY0 = (row4LabelY - 12)
+            local abX1 = abX0 + abW
+            local abY1 = abY0 + abH
+            DrawButton(abX0, abY0, abX1, abY1, airburstOnTTL and "Airburst: ON" or "Airburst: OFF", airburstOnTTL, false, theme.fontSize.normal)
+            hitBoxes.btnAirburst = {id="airburst", x0=abX0, y0=abY0, x1=abX1, y1=abY1}
+            ----------------------------------------------------------------
+            -- Selection legend (PROJECTILE panel)
+            --   Line 1: Muzzle / Trail / Impact
+            --   Line 2: + CTRL = Multi-Select
+            -- Anchored to absolute bottom of the tuning panel (tpY0)
+            ----------------------------------------------------------------
+            local fs = theme.fontSize.normal + 2
+            local legendBaseY = tpY0 + 10  -- absolute bottom
+            local lx = tpX0 + 12
+            local ly = legendBaseY + 20
 
-            glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], theme.text.dim[4])
-            -- Selection legend
+            -- Muzzle (MMB)
+            glColor(1.0, 0.55, 0.15, 1)
+            glRect(lx, ly, lx + 10, ly + 10)
+            glColor(1,1,1,1)
+            glText("Muzzle (MMB)", Snap(lx + 14), Snap(ly), fs-1, "o")
 
-    	----------------------------------------------------------------
-    	-- Selection legend
-    	----------------------------------------------------------------
-    	local legendY = row4Y - 18
-    	local legendX = tpX0 + 12
-    	local fs = theme.fontSize.normal
+            -- Trail (LMB)
+            lx = lx + 110
+            glColor(theme.list.rowBgSel[1], theme.list.rowBgSel[2], theme.list.rowBgSel[3], 1)
+            glRect(lx, ly, lx + 10, ly + 10)
+            glColor(1,1,1,1)
+            glText("Trail (LMB)", Snap(lx + 14), Snap(ly), fs-1, "o")
 
-    	-- Trail (left click)
-    	glColor(theme.list.rowBgSel[1], theme.list.rowBgSel[2], theme.list.rowBgSel[3], 1)
-    	glRect(Snap(legendX), Snap(legendY), Snap(legendX+10), Snap(legendY+10))
-    	glColor(1,1,1,1)
-    	glText("Trail (LMB)", Snap(legendX+16), Snap(legendY-1), fs, "o")
+            -- Impact (RMB)
+            lx = lx + 100
+            glColor(theme.list.rowBgSelImpact[1], theme.list.rowBgSelImpact[2], theme.list.rowBgSelImpact[3], 1)
+            glRect(lx, ly, lx + 10, ly + 10)
+            glColor(1,1,1,1)
+            glText("Impact (RMB)", Snap(lx + 14), Snap(ly), fs-1, "o")
 
-    	-- Impact (right click)
-    	local ix = legendX + 110
-    	glColor(theme.list.rowBgSelImpact[1], theme.list.rowBgSelImpact[2], theme.list.rowBgSelImpact[3], 1)
-    	glRect(Snap(ix), Snap(legendY), Snap(ix+10), Snap(legendY+10))
-    	glColor(1,1,1,1)
-    	glText("Impact (RMB)", Snap(ix+16), Snap(legendY-1), fs, "o")
+            -- Second line: CTRL hint
+            glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], 1)
+            glText("+ CTRL = Multi-Select", Snap(tpX0 + 12), Snap(legendBaseY), fs-1, "o")
 
-    	-- Multi-select hint (to the right)
-    	local impactLabel = "Impact (RMB)"
-    	local ctrlFs = fs - 1
-    	local ctrlX = ix + 16 + (glGetTextWidth(impactLabel) * fs) + 14
+            -- Preserve listTop calculation (required by list renderer)
+            local PANEL_GAP = 4
+	    listTop = tpY0 - PANEL_GAP
 
-    	glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], 1)
-    	glText("+ CTRL = Multi-Select", Snap(ctrlX), Snap(legendY-1), ctrlFs, "o")
 
-            listTop = tpY0 - 10
-        else
+
+else
 
             glColor(theme.tuningPanel.bg[1], theme.tuningPanel.bg[2], theme.tuningPanel.bg[3], theme.tuningPanel.bg[4])
             DrawRoundedRectFilled(tpX0, tpY0, tpX1, tpY1, CORNER_WINDOW_RADIUS)
@@ -1088,9 +1228,34 @@ function widget:DrawScreen()
             ----------------------------------------------------------------
             local legendY = tpY0 + 6
             local legendX = tpX0 + 12
-            local fs = theme.fontSize.normal
+            local fs = theme.fontSize.normal + 2
             glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], 1)
-            glText("+ CTRL = multi-select", Snap(legendX), Snap(legendY), fs-1, "o")
+            glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], 1)
+            
+            -- Ground panel legend (Baseline #5.5)
+            local lgx = Snap(tpX0 + 12)
+
+            -- Line 1: Selected CEG (LMB) + CTRL multi-select
+            glColor(0.15, 0.85, 0.25, 0.90)
+            glRect(lgx,
+                   Snap(tpY0 + 22),
+                   lgx + 10,
+                   Snap(tpY0 + 32))
+            glColor(1,1,1,1)
+            glText("Selected CEG (LMB)   + CTRL = Multi-Select",
+                   lgx + 14,
+                   Snap(tpY0 + 24),
+                   theme.fontSize.normal+1,
+                   "o")
+
+            -- Line 2: Mouse buttons note
+            glText("MMB / RMB: have no effect on this panel",
+                   lgx,
+                   Snap(tpY0 + 6),
+                   theme.fontSize.normal,
+                   "o")
+
+
             listTop = tpY0 - 10
         end
 
@@ -1128,12 +1293,15 @@ function widget:DrawScreen()
             local name   = filteredCEGs[idx]
             local isTrail  = selectedCEGs[name]
             local isImpact = selectedImpactCEGs[name]
+            local isMuzzle = selectedMuzzleCEGs and selectedMuzzleCEGs[name]
 
             local bg
             if isTrail then
                 bg = theme.list.rowBgSel
             elseif isImpact then
                 bg = theme.list.rowBgSelImpact
+            elseif isMuzzle then
+                bg = {1.0, 0.55, 0.15, 1.0} -- ORANGE (muzzle)
             else
                 bg = theme.list.rowBg
             end
@@ -1143,7 +1311,7 @@ function widget:DrawScreen()
             glColor(theme.list.border[1], theme.list.border[2], theme.list.border[3], theme.list.border[4])
             glRect(Snap(xCell0), Snap(y0r), Snap(xCell1), Snap(y0r+1))
 
-            local txtCol = (isTrail or isImpact) and theme.list.rowTextSel or theme.list.rowText
+            local txtCol = (isTrail or isImpact or isMuzzle) and theme.list.rowTextSel or theme.list.rowText
             glColor(txtCol[1],txtCol[2],txtCol[3],txtCol[4])
             local show = name
             if #show > 28 then show = show:sub(1,26).."..."
@@ -1156,9 +1324,10 @@ function widget:DrawScreen()
                 local mx2, my2 = spGetMouseState()
                 if mx2 >= xCell0 and mx2 <= xCell1 and my2 >= y0r and my2 <= y1r then
                     altHoverCEG = {
-                        name     = name,
-                        isTrail  = isTrail,
-                        isImpact = isImpact,
+                        name      = name,
+                        isTrail   = isTrail,
+                        isImpact  = isImpact,
+                        isMuzzle  = isMuzzle,
                     }
                 end
             end
@@ -1241,6 +1410,14 @@ glText(string.format("Page %d / %d", curPage, totalPages),
             glText(suf, tx + pad + pw, ty + h - pad - fs, fs, "o")
         end
     end
+
+    ----------------------------------------------------------------
+    -- Forge panel overlay draw (mode-agnostic; always draw when open)
+    ----------------------------------------------------------------
+    if WG.CEGForge and WG.CEGForge.Draw and WG.CEGForge.IsOpen and WG.CEGForge.IsOpen() then
+        WG.CEGForge.Draw()
+    end
+
 end
 
 --------------------------------------------------------------------------------
@@ -1248,8 +1425,15 @@ end
 --------------------------------------------------------------------------------
 
 function widget:MousePress(mx, my, button)
+    -- Forge module (CEG INFO panel) gets first right of refusal, even outside browser window
+    if WG.CEGForge and WG.CEGForge.MousePress then
+        if WG.CEGForge.MousePress(mx, my, button) then
+            return true
+        end
+    end
+
     if MouseInWindow(mx,my) then
-        if button ~= 1 and button ~= 3 then
+        if button ~= 1 and button ~= 2 and button ~= 3 then
             return true
         end
 
@@ -1291,6 +1475,24 @@ function widget:MousePress(mx, my, button)
         local glob     = topButtons.glob
         local resetSel = topButtons.resetSel
 
+	-- CEG Forge toggle
+	local forge = topButtons.forge
+	if forge
+   	   and mx >= forge.x0 and mx <= forge.x1
+   	   and my >= forge.y0 and my <= forge.y1
+	then
+    	if WG.CEGForge then
+            if WG.CEGForge.IsOpen and WG.CEGForge.IsOpen() then
+                WG.CEGForge.Close()
+            elseif WG.CEGForge.Open then
+                local srcFile = ResolveCEGSourceFile(lastSelected)
+		WG.CEGForge.Open(lastSelected, srcFile)
+            end
+        end
+        return true
+    end
+
+
         if cheat and mx>=cheat.x0 and mx<=cheat.x1 and my>=cheat.y0 and my<=cheat.y1 then
             cheatOn = not cheatOn
             spSendCommands("cheat")
@@ -1310,6 +1512,10 @@ function widget:MousePress(mx, my, button)
 	    -- Clear impact (right-click) selections
 	    selectedImpactCEGs = {}
 	    lastImpactSelected = nil
+
+	    -- Clear muzzle (middle-click) selections
+	    selectedMuzzleCEGs = {}
+	    lastMuzzleSelected = nil
 
 	    spEcho("[CEG Proj Preview] Selection reset.")
 	    return true
@@ -1331,28 +1537,21 @@ function widget:MousePress(mx, my, button)
 
         local tbx = hitBoxes.tuningBtn
         if tbx and mx>=tbx.x0 and mx<=tbx.x1 and my>=tbx.y0 and my<=tbx.y1 then
-            if groundArmed then
-                -- disarming ground: fully exit ground spawn mode
-                groundArmed = false
-                settingsMode = nil
-            else
-                -- arming ground
-                settingsMode = "ceg"
-                groundArmed = true
-                fireArmed   = false
-            end
+            settingsMode = "ceg"
+            groundArmed = not groundArmed
+            fireArmed   = false
             Spring.Echo("[CEG Browser] Ground mode: " .. (groundArmed and "ARMED" or "OFF"))
             return true
         end
 
         local fb = hitBoxes.fireBtn
-        if fb and mx>=fb.x0 and mx<=fb.x1 and my>=fb.y0 and my<=fb.y1 then
-            settingsMode = "projectile"
-            fireArmed   = not fireArmed
-            groundArmed = false
-            Spring.Echo("[CEG Proj Preview] Fire mode: " .. (fireArmed and "ON" or "OFF"))
-            return true
-        end
+	if fb and mx>=fb.x0 and mx<=fb.x1 and my>=fb.y0 and my<=fb.y1 then
+    	    settingsMode = "projectile"
+    groundArmed = false
+    	    fireArmed = not fireArmed
+    	    Spring.Echo("[CEG Proj Preview] Fire mode: " .. (fireArmed and "ON" or "OFF"))
+    	    return true
+	end
 
 
         for _,ab in ipairs(hitBoxes.alphaButtons or {}) do
@@ -1393,6 +1592,15 @@ if settingsMode == "projectile" then
             local sbx= hitBoxes.sliderSpeed
 
             local gb = hitBoxes.sliderGravity
+        local pf = hitBoxes.sliderProjForward
+        local pu = hitBoxes.sliderProjUp
+        local tt = hitBoxes.sliderTTL
+        local ab = hitBoxes.btnAirburst
+            if ab and mx>=ab.x0 and mx<=ab.x1 and my>=ab.y0 and my<=ab.y1 then
+            airburstOnTTL = not airburstOnTTL
+            return true
+        end
+
             if yb and mx>=yb.x0 and mx<=yb.x1 and my>=yb.y0 and my<=yb.y1 then
                 draggingSlider = "yaw"
                 local t = Clamp((mx - yb.x0)/(yb.x1-yb.x0),0,1)
@@ -1421,7 +1629,42 @@ if settingsMode == "projectile" then
                 return true
             end
 
-            if gb and mx>=gb.x0 and mx<=gb.x1 and my>=gb.y0 and my<=gb.y1 then
+    
+        if pf and mx>=pf.x0 and mx<=pf.x1 and my>=pf.y0 and my<=pf.y1 then
+            draggingSlider = "proj_forward"
+            lastMouseX = mx
+            lastMouseY = my
+            local t = Clamp((mx - pf.x0)/(pf.x1 - pf.x0), 0, 1)
+            local v = 0 + t * 100
+            local alt, ctrl = spGetModKeyState()
+            if ctrl then v = RoundToStep(v, 1) end
+            projectileForwardOffset = Clamp(v, 0, 100)
+            return true
+        end
+
+        if tt and mx>=tt.x0 and mx<=tt.x1 and my>=tt.y0 and my<=tt.y1 then
+            draggingSlider = "ttl"
+            local t = Clamp((mx - tt.x0)/(tt.x1 - tt.x0), 0, 1)
+            local v = 1 + t * (30 - 1)
+            local alt, ctrl = spGetModKeyState()
+            if ctrl then v = RoundToStep(v, 0.5) end
+            ttlSeconds = Clamp(v, 1, 30)
+            return true
+        end
+
+        if pu and mx>=pu.x0 and mx<=pu.x1 and my>=pu.y0 and my<=pu.y1 then
+            draggingSlider = "proj_up"
+            lastMouseX = mx
+            lastMouseY = my
+            local t = Clamp((mx - pu.x0)/(pu.x1 - pu.x0), 0, 1)
+            local v = 0 + t * 100
+            local alt, ctrl = spGetModKeyState()
+            if ctrl then v = RoundToStep(v, 1) end
+            projectileUpOffset = Clamp(v, 0, 100)
+            return true
+        end
+
+        if gb and mx>=gb.x0 and mx<=gb.x1 and my>=gb.y0 and my<=gb.y1 then
                 draggingSlider = "gravity"
                 local t = Clamp((mx - gb.x0)/(gb.x1-gb.x0),0,1)
                 local v = -1.0 + t*2.0
@@ -1442,23 +1685,61 @@ if settingsMode == "projectile" then
                     return true
                 end
                 local alt, ctrl, meta, shift = spGetModKeyState()
-                -- LEFT CLICK = trail
-                if button == 1 then
+
+                -- MIDDLE CLICK = muzzle (CTRL = multi-select)
+                if button == 2 then
                     if ctrl then
-                        if selectedCEGs[name] then
-                            selectedCEGs[name] = nil
-                            if lastSelected == name then lastSelected = nil end
+                        if selectedMuzzleCEGs[name] then
+                            selectedMuzzleCEGs[name] = nil
+                            if lastMuzzleSelected == name then lastMuzzleSelected = nil end
                         else
-                            selectedCEGs[name] = true
-                            lastSelected = name
+                            selectedMuzzleCEGs[name] = true
+                            lastMuzzleSelected = name
                         end
                     else
-                        selectedCEGs = {}
-                        selectedCEGs[name] = true
-                        lastSelected = name
+                        selectedMuzzleCEGs = {}
+                        selectedMuzzleCEGs[name] = true
+                        lastMuzzleSelected = name
                     end
                     return true
                 end
+
+                -- LEFT CLICK = trail
+		if button == 1 then
+    		    if ctrl then
+        	        if selectedCEGs[name] then
+            		    selectedCEGs[name] = nil
+            		    if lastSelected == name then
+                		lastSelected = nil
+
+                -- 🔔 Notify Forge: selection cleared
+                if WG.CEGForge and WG.CEGForge.SetSource then
+                    WG.CEGForge.SetSource(nil, nil)
+                end
+            end
+        else
+            selectedCEGs[name] = true
+            lastSelected = name
+
+            -- 🔔 Notify Forge: new primary selection
+            if WG.CEGForge and WG.CEGForge.SetSource then
+                local srcFile = ResolveCEGSourceFile(lastSelected)
+		WG.CEGForge.SetSource(lastSelected, srcFile)
+            end
+        end
+    else
+        selectedCEGs = {}
+        selectedCEGs[name] = true
+        lastSelected = name
+
+        -- 🔔 Notify Forge: new primary selection
+        if WG.CEGForge and WG.CEGForge.SetSource then
+            local srcFile = ResolveCEGSourceFile(lastSelected)
+	    WG.CEGForge.SetSource(lastSelected, srcFile)
+        end
+    end
+    return true
+end
 
                 -- RIGHT CLICK = impact
                 if button == 3 then
@@ -1504,14 +1785,20 @@ if settingsMode == "projectile" then
                 local scb = hitBoxes.sliderCount
                 if scb and mx>=scb.x0 and mx<=scb.x1 and my>=scb.y0 and my<=scb.y1 then
                     draggingSlider = "ceg_count"
+                    lastMouseX = mx
+                    lastMouseY = my
                     local t = Clamp((mx - scb.x0)/(scb.x1-scb.x0),0,1)
-                    cegSpawnCount = Clamp(math.floor(t*100+0.5),1,100)
+                    local v = 1 + t * (100 - 1)
+                    cegSpawnCountF = Clamp(v, 1, 100)
+                    cegSpawnCount  = Clamp(math.floor(cegSpawnCountF + 0.5), 1, 100)
                     return true
                 end
 
                 local shb = hitBoxes.sliderHeight
                 if shb and mx>=shb.x0 and mx<=shb.x1 and my>=shb.y0 and my<=shb.y1 then
                     draggingSlider = "ceg_height"
+                    lastMouseX = mx
+                    lastMouseY = my
                     local t = Clamp((mx - shb.x0)/(shb.x1-shb.x0),0,1)
                     cegHeightOffset = Clamp(math.floor(t*800+0.5),0,800)
                     return true
@@ -1519,8 +1806,11 @@ if settingsMode == "projectile" then
         local ssb = hitBoxes.sliderSpace
                 if ssb and mx>=ssb.x0 and mx<=ssb.x1 and my>=ssb.y0 and my<=ssb.y1 then
                     draggingSlider = "ceg_spacing"
+                    lastMouseX = mx
+                    lastMouseY = my
                     local t = Clamp((mx - ssb.x0)/(ssb.x1-ssb.x0),0,1)
-                    cegSpacing = Clamp(math.floor(t*128+0.5),0,128)
+                    cegSpacingF = Clamp(t * 128, 0, 128)
+                    cegSpacing  = Clamp(math.floor(cegSpacingF + 0.5), 0, 128)
                     return true
                 end
             end
@@ -1532,12 +1822,12 @@ if settingsMode == "projectile" then
 
         if settingsMode == "projectile" and fireArmed and not MouseInWindow(mx, my) then
             FireSelectedProjectiles()
-            return true
+            return false
         end
 
-        if settingsMode == "ceg" and not MouseInWindow(mx, my) then
+        if settingsMode == "ceg" and groundArmed and not MouseInWindow(mx, my) then
             SpawnGroundCEGs()
-            return true
+            return false
         end
     end
 
@@ -1577,70 +1867,166 @@ function widget:MouseMove(mx, my, dx, dy, button)
             end
             return true
 
-        elseif draggingSlider == "speed" and hitBoxes.sliderSpeed then
-            if ctrl then
-                speedVal = Clamp(speedVal + dx * 0.6, 0, 600)
-            else
-                local b = hitBoxes.sliderSpeed
-                local t = Clamp((mx - b.x0)/(b.x1-b.x0),0,1)
-                speedVal = t*600
-            end
-            return true
+        
+            elseif draggingSlider == "speed" then
+                if ctrl then
+                    speedVal = Clamp(
+                        speedVal + dx * 0.4,
+                        0, 600
+                    )
+                else
+                    local b = hitBoxes.sliderSpeed
+                    if b then
+                        local t = Clamp((mx - b.x0)/(b.x1 - b.x0), 0, 1)
+                        speedVal = 0 + t * (600)
+                    end
+                end
+                lastMouseX = mx
+                lastMouseY = my
+                return true
 
-        elseif draggingSlider == "gravity" and hitBoxes.sliderGravity then
-            if ctrl then
-                gravityVal = Clamp(
-                    RoundToStep(gravityVal + dx * 0.002, 0.01),
-                    -1.0, 1.0
-                )
-            else
-                local b = hitBoxes.sliderGravity
-                local t = Clamp((mx - b.x0)/(b.x1-b.x0),0,1)
-                gravityVal = -1.0 + t*2.0
-            end
-            return true
+
+
+        
+            
+            elseif draggingSlider == "proj_forward" then
+                if ctrl then
+                    projectileForwardOffset = Clamp(
+                        projectileForwardOffset + dx * 0.15,
+                        0, 100
+                    )
+                else
+                    local b = hitBoxes.sliderProjForward
+                    if b then
+                        local t = Clamp((mx - b.x0)/(b.x1 - b.x0), 0, 1)
+                        projectileForwardOffset = 0 + t * (100)
+                    end
+                end
+                lastMouseX = mx
+                lastMouseY = my
+                return true
+
+
+
+        
+            
+            elseif draggingSlider == "ttl" then
+                if ctrl then
+                    ttlSeconds = Clamp(ttlSeconds + dx * 0.05, 1, 30)
+                else
+                    local b = hitBoxes.sliderTTL
+                    if b then
+                        local t = Clamp((mx - b.x0)/(b.x1 - b.x0), 0, 1)
+                        ttlSeconds = 1 + t * (30 - 1)
+                    end
+                end
+                lastMouseX = mx
+                lastMouseY = my
+                return true
+
+            elseif draggingSlider == "proj_up" then
+                if ctrl then
+                    projectileUpOffset = Clamp(
+                        projectileUpOffset + dx * 0.15,
+                        0, 100
+                    )
+                else
+                    local b = hitBoxes.sliderProjUp
+                    if b then
+                        local t = Clamp((mx - b.x0)/(b.x1 - b.x0), 0, 1)
+                        projectileUpOffset = 0 + t * (100)
+                    end
+                end
+                lastMouseX = mx
+                lastMouseY = my
+                return true
+
+
+        
+            
+            elseif draggingSlider == "gravity" then
+                if ctrl then
+                    gravityVal = Clamp(
+                        gravityVal + dx * 0.005,
+                        -1.0, 1.0
+                    )
+                else
+                    local b = hitBoxes.sliderGravity
+                    if b then
+                        local t = Clamp((mx - b.x0)/(b.x1 - b.x0), 0, 1)
+                        gravityVal = -1.0 + t * (2.0)
+                    end
+                end
+                lastMouseX = mx
+                lastMouseY = my
+                return true
+
+
         end
     end
+
 
     -- Ground (CEG) sliders
     if draggingSlider and settingsMode == "ceg" then
         local alt, ctrl = spGetModKeyState()
 
-        -- CTRL = fine relative adjustment
-        if ctrl then
-            if draggingSlider == "ceg_count" then
-                cegSpawnCount = Clamp(math.floor(cegSpawnCount + dx * 0.20 + 0.5), 1, 100)
+        -- Spawn Count (silky CTRL fine drag, consistent with other sliders)
+        if draggingSlider == "ceg_count" then
+            if ctrl then
+                local ddx = mx - (lastMouseX or mx)
+                cegSpawnCountF = Clamp((cegSpawnCountF or cegSpawnCount) + ddx * 0.10, 1, 100)
+                cegSpawnCount  = Clamp(math.floor(cegSpawnCountF + 0.5), 1, 100)
+                lastMouseX = mx
+                lastMouseY = my
                 return true
-            elseif draggingSlider == "ceg_spacing" then
-                cegSpacing = Clamp(math.floor(cegSpacing + dx * 0.20 + 0.5), 0, 128)
-                return true
-            elseif draggingSlider == "ceg_height" then
-                cegHeightOffset = Clamp(math.floor(cegHeightOffset + dx * 1.00 + 0.5), 0, 800)
+            else
+                local b = hitBoxes.sliderCount
+                if b then
+                    local t = Clamp((mx - b.x0)/(b.x1-b.x0), 0, 1)
+                    cegSpawnCountF = Clamp(1 + t * (100 - 1), 1, 100)
+                    cegSpawnCount  = Clamp(math.floor(cegSpawnCountF + 0.5), 1, 100)
+                    lastMouseX = mx
+                    lastMouseY = my
+                end
                 return true
             end
         end
 
-        -- Normal drag = absolute follow
-        if draggingSlider == "ceg_count" and hitBoxes.sliderCount then
-            local b = hitBoxes.sliderCount
-            local t = Clamp((mx - b.x0)/(b.x1-b.x0),0,1)
-            local v = 1 + t*(100-1)
-            cegSpawnCount = Clamp(math.floor(v + 0.5), 1, 100)
-            return true
+        -- Spacing (fixed hitbox name + unified float accumulator)
+        if draggingSlider == "ceg_spacing" then
+            if ctrl then
+                local ddx = mx - (lastMouseX or mx)
+                cegSpacingF = Clamp((cegSpacingF or cegSpacing) + ddx * 0.25, 0, 128)
+                cegSpacing  = Clamp(math.floor(cegSpacingF + 0.5), 0, 128)
+                lastMouseX = mx
+                lastMouseY = my
+                return true
+            else
+                local b = hitBoxes.sliderSpace
+                if b then
+                    local t = Clamp((mx - b.x0)/(b.x1-b.x0), 0, 1)
+                    cegSpacingF = Clamp(t * 128, 0, 128)
+                    cegSpacing  = Clamp(math.floor(cegSpacingF + 0.5), 0, 128)
+                    lastMouseX = mx
+                    lastMouseY = my
+                end
+                return true
+            end
+        end
 
-        elseif draggingSlider == "ceg_spacing" and hitBoxes.sliderSpace then
-            local b = hitBoxes.sliderSpace
-            local t = Clamp((mx - b.x0)/(b.x1-b.x0),0,1)
-            local v = t*128
-            cegSpacing = Clamp(math.floor(v + 0.5), 0, 128)
-            return true
-
-        elseif draggingSlider == "ceg_height" and hitBoxes.sliderHeight then
-            local b = hitBoxes.sliderHeight
-            local t = Clamp((mx - b.x0)/(b.x1-b.x0),0,1)
-            local v = t*800
-            cegHeightOffset = Clamp(math.floor(v + 0.5), 0, 800)
-            return true
+        -- Height Offset (leave existing feel; CTRL fine relative adjustment)
+        if draggingSlider == "ceg_height" then
+            if ctrl then
+                cegHeightOffset = Clamp(math.floor(cegHeightOffset + dx * 1.00 + 0.5), 0, 800)
+                return true
+            else
+                local b = hitBoxes.sliderHeight
+                if b then
+                    local t = Clamp((mx - b.x0)/(b.x1-b.x0), 0, 1)
+                    cegHeightOffset = Clamp(math.floor(t * 800 + 0.5), 0, 800)
+                end
+                return true
+            end
         end
     end
 
@@ -1649,6 +2035,19 @@ end
 
 
 
+
+
+--------------------------------------------------------------------------------
+-- Mouse wheel (delegated to Forge panel when open/hovered)
+--------------------------------------------------------------------------------
+function widget:MouseWheel(up, value)
+    if WG.CEGForge and WG.CEGForge.MouseWheel then
+        if WG.CEGForge.MouseWheel(up, value) then
+            return true
+        end
+    end
+    return false
+end
 
 function widget:MouseRelease(mx, my, button)
     -- Always release drag state on mouse up (prevents stuck sliders)
@@ -1698,3 +2097,502 @@ function widget:TextInput(ch)
     RebuildFiltered()
     return true
 end
+
+
+--------------------------------------------------------------------------------
+-- FORGE MODULE (Embedded CEG Info Panel)
+--------------------------------------------------------------------------------
+do
+--------------------------------------------------------------------------------
+-- CEG Forge
+-- Companion panel for the CEG Browser
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+-- Engine refs
+--------------------------------------------------------------------------------
+
+local spGetViewGeometry = Spring.GetViewGeometry
+local glColor          = gl.Color
+local glRect           = gl.Rect
+local glText           = gl.Text
+
+--------------------------------------------------------------------------------
+-- Text wrapping helpers (Forge-only, UI-safe)
+--------------------------------------------------------------------------------
+local function WordWrap(text, maxWidth, fontSize)
+    local lines = {}
+    local spaceW = gl.GetTextWidth(" ") * fontSize
+
+    for paragraph in tostring(text or ""):gmatch("[^\n]+") do
+        local line = ""
+        local lineW = 0
+
+        for word in paragraph:gmatch("%S+") do
+            local wordW = gl.GetTextWidth(word) * fontSize
+
+            -- Clamp absurdly long tokens (e.g. colormap strings with no sensible breaks)
+            if wordW > maxWidth then
+                local ratio = maxWidth / math.max(1, wordW)
+                local cut = math.max(1, math.floor(#word * ratio))
+                word = word:sub(1, cut) .. "…"
+                wordW = gl.GetTextWidth(word) * fontSize
+            end
+
+            if line == "" then
+                line = word
+                lineW = wordW
+            elseif lineW + spaceW + wordW <= maxWidth then
+                line = line .. " " .. word
+                lineW = lineW + spaceW + wordW
+            else
+                lines[#lines + 1] = line
+                line = word
+                lineW = wordW
+            end
+
+        end
+
+        if line ~= "" then
+            lines[#lines + 1] = line
+        end
+    end
+
+    return lines
+end
+
+local function DrawWrappedText(text, x, y, maxWidth, fontSize, lineH)
+    lineH = lineH or (fontSize + 2)
+    local lines = WordWrap(text, maxWidth, fontSize)
+    local cy = y
+    for i = 1, #lines do
+        gl.Text(lines[i], x, cy, fontSize, "o")
+        cy = cy - lineH
+    end
+    return y - math.max(0, (#lines - 1)) * lineH, #lines
+end
+
+local glLineWidth      = gl.LineWidth
+local glBeginEnd       = gl.BeginEnd
+local glVertex         = gl.Vertex
+
+local GL = GL
+
+--------------------------------------------------------------------------------
+-- Theme
+--------------------------------------------------------------------------------
+
+local theme = {
+    window = {
+        bg        = {0.03, 0.03, 0.03, 0.92},
+        border    = {0.10, 0.10, 0.10, 1.00},
+        titleBg   = {0.00, 0.00, 0.00, 0.55},
+        titleText = {1.00, 1.00, 1.00, 1.00},
+    },
+    tree = {
+        key     = {0.85, 0.85, 0.85, 1.00},
+        value   = {0.70, 0.80, 1.00, 1.00},
+        table   = {0.60, 0.60, 0.60, 1.00},
+        indent  = 14,
+    },
+    fontSize = {
+        title  = 18,
+        normal = 14,
+        small  = 14,
+    },
+}
+
+local PADDING = 10
+local CORNER_WINDOW_RADIUS = 6
+local LINE_H = 14
+
+--------------------------------------------------------------------------------
+-- State
+--------------------------------------------------------------------------------
+
+local forgeOpen  = false
+local scrollY    = 0
+local maxScrollY = 0
+local forgeCloseBtn = nil
+
+local sourceName = nil
+local sourceDef  = nil
+local sourceFile = nil
+
+local forgeX, forgeY, forgeW, forgeH
+forgeW = 420
+
+--------------------------------------------------------------------------------
+-- WG API
+--------------------------------------------------------------------------------
+
+WG.CEGForge = WG.CEGForge or {}
+--------------------------------------------------------------------------------
+-- Deep copy helper
+--------------------------------------------------------------------------------
+
+local function DeepCopy(src)
+    if type(src) ~= "table" then
+        return src
+    end
+    local dst = {}
+    for k, v in pairs(src) do
+        dst[k] = DeepCopy(v)
+    end
+    return dst
+end
+
+--------------------------------------------------------------------------------
+-- Definition finder (handles wrapper / nested effect files)
+--------------------------------------------------------------------------------
+
+local function FindDefRecursive(root, targetName, maxDepth)
+    if type(root) ~= "table" then
+        return nil
+    end
+    maxDepth = maxDepth or 5
+    local seen = {}
+
+    local function walk(t, depth)
+        if type(t) ~= "table" then return nil end
+        if seen[t] then return nil end
+        seen[t] = true
+        if depth > maxDepth then return nil end
+
+        local v = rawget(t, targetName)
+        if type(v) == "table" then
+            return v
+        end
+
+        for _, vv in pairs(t) do
+            if type(vv) == "table" then
+                local found = walk(vv, depth + 1)
+                if found then return found end
+            end
+        end
+        return nil
+    end
+
+    return walk(root, 0)
+end
+
+--------------------------------------------------------------------------------
+-- Internal clone logic (file-driven, no lookup)
+--------------------------------------------------------------------------------
+
+local function CloneCEG(name, file)
+    sourceName = name
+    sourceDef  = nil
+    sourceFile = file
+
+    if not name or not file then return end
+
+    local ok, defs = pcall(VFS.Include, file)
+    if not ok or type(defs) ~= "table" then return end
+
+    local def = defs[name]
+    if type(def) ~= "table" then
+        def = FindDefRecursive(defs, name, 6)
+    end
+    if type(def) ~= "table" then return end
+
+    sourceDef = DeepCopy(def)
+end
+
+--------------------------------------------------------------------------------
+-- Open / Close / Update
+--------------------------------------------------------------------------------
+
+function WG.CEGForge.Open(name, file)
+    forgeOpen = true
+    CloneCEG(name, file)
+end
+
+function WG.CEGForge.SetSource(name, file)
+    if not forgeOpen then return end
+    CloneCEG(name, file)
+end
+
+function WG.CEGForge.Close()
+    forgeOpen  = false
+    sourceName = nil
+    sourceDef  = nil
+    sourceFile = nil
+end
+
+function WG.CEGForge.IsOpen()
+    return forgeOpen
+end
+
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+local function Snap(v)
+    return math.floor(v + 0.5)
+end
+
+--------------------------------------------------------------------------------
+-- Rounded rect helpers
+--------------------------------------------------------------------------------
+
+local function DrawRoundedRectFilled(x0, y0, x1, y1, r)
+    x0, y0, x1, y1 = Snap(x0), Snap(y0), Snap(x1), Snap(y1)
+    r = math.max(0, math.min(r, math.min((x1-x0)/2, (y1-y0)/2)))
+
+    glRect(x0 + r, y0,     x1 - r, y1)
+    glRect(x0,     y0 + r, x1,     y1 - r)
+
+    local steps = 8
+    local function corner(cx, cy, a0, a1)
+        glBeginEnd(GL.TRIANGLE_FAN, function()
+            glVertex(cx, cy)
+            for i = 0, steps do
+                local a = a0 + (a1 - a0) * (i / steps)
+                glVertex(cx + math.cos(a)*r, cy + math.sin(a)*r)
+            end
+        end)
+    end
+
+    corner(x0+r, y0+r, math.pi, 1.5*math.pi)
+    corner(x1-r, y0+r, 1.5*math.pi, 2*math.pi)
+    corner(x1-r, y1-r, 0, 0.5*math.pi)
+    corner(x0+r, y1-r, 0.5*math.pi, math.pi)
+end
+
+--------------------------------------------------------------------------------
+-- Layout
+--------------------------------------------------------------------------------
+
+local function UpdateLayout()
+    local vsx, vsy = spGetViewGeometry()
+
+    if WG.CEGBrowser and WG.CEGBrowser.GetPanelRect then
+        local bx0, by0, bx1, by1 = WG.CEGBrowser.GetPanelRect()
+        if bx0 then
+            forgeX = bx0 - forgeW - 8
+            forgeY = by0
+            forgeH = by1 - by0
+            return
+        end
+    end
+
+    forgeX = 10
+    forgeY = 100
+    forgeH = vsy - 200
+end
+
+--------------------------------------------------------------------------------
+-- Tree rendering (read-only)
+--------------------------------------------------------------------------------
+
+local function DrawValue(val, x, y, maxWidth)
+    if type(val) == "table" then
+        glColor(theme.tree.table)
+        glText("{ }", x, y, theme.fontSize.small, "o")
+        return y, 1
+    end
+
+    glColor(theme.tree.value)
+    local s = tostring(val)
+
+    -- Wrap only when we have a sane width budget
+    if maxWidth and maxWidth > 20 then
+        local newY, nLines = DrawWrappedText(s, x, y, maxWidth, theme.fontSize.small, LINE_H)
+        return newY, nLines
+    else
+        glText(s, x, y, theme.fontSize.small, "o")
+        return y, 1
+    end
+end
+
+local function DrawTable(tbl, x, y, depth)
+    local startY = y
+    for k, v in pairs(tbl) do
+        local indent = depth * theme.tree.indent
+        glColor(theme.tree.key)
+        glText(tostring(k) .. ":", x + indent, y, theme.fontSize.small, "o")
+
+        local keyText = tostring(k) .. ":"
+	local keyW = gl.GetTextWidth(keyText) * theme.fontSize.small
+	local valueX = x + indent + keyW + 8
+        local maxW = (forgeX + forgeW - PADDING) - valueX
+
+        if type(v) == "table" then
+            DrawValue(v, valueX, y, maxW)
+            y = DrawTable(v, x, y - LINE_H, depth + 1)
+        else
+            local newY = select(1, DrawValue(v, valueX, y, maxW))
+            y = newY - LINE_H
+        end
+    end
+    return y, (startY - y)
+end
+
+--------------------------------------------------------------------------------
+-- Draw
+--------------------------------------------------------------------------------
+
+function WG.CEGForge.Draw()
+if not forgeOpen then return end
+
+    UpdateLayout()
+
+    local x0, y0 = forgeX, forgeY
+    local x1, y1 = forgeX + forgeW, forgeY + forgeH
+
+    glColor(theme.window.bg)
+    DrawRoundedRectFilled(x0, y0, x1, y1, CORNER_WINDOW_RADIUS)
+
+    glColor(theme.window.border)
+    DrawRoundedRectFilled(x0, y0, x1, y1, CORNER_WINDOW_RADIUS)
+
+    local titleH = 28
+    glColor(theme.window.titleBg)
+    glRect(x0 + CORNER_WINDOW_RADIUS, y1 - titleH, x1 - CORNER_WINDOW_RADIUS, y1)
+
+    glColor(theme.window.titleText)
+    glText("CEG Information", x0 + PADDING, y1 - titleH + 7, theme.fontSize.title, "o")
+
+    -- Close button (browser-style red X)
+    local btnW, btnH = 22, 18
+    local btnPad = 6
+
+    forgeCloseBtn = {
+        x0 = x1 - btnPad - btnW,
+        y0 = y1 - titleH + (titleH - btnH) / 2,
+        x1 = x1 - btnPad,
+        y1 = y1 - titleH + (titleH - btnH) / 2 + btnH,
+    }
+
+    glColor(0.40, 0.10, 0.10, 1.00)
+    DrawRoundedRectFilled(
+        forgeCloseBtn.x0,
+        forgeCloseBtn.y0,
+        forgeCloseBtn.x1,
+        forgeCloseBtn.y1,
+        4
+    )
+
+    glColor(0.20, 0.02, 0.02, 1.00)
+    glRect(
+        forgeCloseBtn.x0,
+        forgeCloseBtn.y0,
+        forgeCloseBtn.x1,
+        forgeCloseBtn.y1
+    )
+
+    glColor(1, 1, 1, 1)
+    glText(
+        "x",
+        forgeCloseBtn.x0 + 7,
+        forgeCloseBtn.y0 + 2,
+        theme.fontSize.normal,
+        "o"
+    )
+
+    local cy = y1 - titleH - 20
+    glColor(0.9, 0.9, 0.9, 1)
+    glText("CEG Definition is located in this file:", x0 + PADDING, cy, theme.fontSize.normal, "o")
+
+    cy = cy - 18
+    if sourceFile then
+        glColor(0.7, 0.8, 1.0, 1)
+        glText(sourceFile, x0 + PADDING, cy, theme.fontSize.small, "o")
+    else
+        glColor(0.6, 0.6, 0.6, 1)
+        glText("(no source)", x0 + PADDING, cy, theme.fontSize.small, "o")
+    end
+
+    cy = cy - 24
+    
+    if sourceDef then
+        -- Top of scrollable content (just under header text)
+        local contentTop = cy + 5
+	local textTopPadding = 10
+
+        -- Bottom of scrollable content (inside window padding)
+        local contentBottom = forgeY + PADDING
+
+        -- Visible height of scroll area
+        local viewHeight = contentTop - contentBottom
+
+        -- Draw clipped, scrolled content
+        gl.Scissor(
+            math.floor(forgeX),
+            math.floor(contentBottom),
+            math.floor(forgeW),
+            math.floor(viewHeight)
+        )
+
+        gl.PushMatrix()
+	gl.Translate(0, scrollY, 0)
+
+	local endY, contentHeight =
+    	   DrawTable(sourceDef, x0 + PADDING, contentTop - textTopPadding, 0)
+
+	gl.PopMatrix()
+
+	-- Restore full viewport scissor
+	local vsx, vsy = spGetViewGeometry()
+	gl.Scissor(0, 0, vsx, vsy)
+
+	-- Clamp scroll (positive space, canonical)
+	contentHeight = contentHeight or 0
+	local maxScroll = math.max(0, contentHeight - viewHeight)
+	maxScrollY = maxScroll
+
+	scrollY = math.max(0, math.min(maxScroll, scrollY))
+
+    else
+
+        glColor(0.6, 0.6, 0.6, 1)
+        glText("Select a CEG in the browser to load definition.", x0 + PADDING, cy, theme.fontSize.small, "o")
+    end
+end
+
+--------------------------------------------------------------------------------
+-- Mouse wheel scrolling (Forge definition panel only)
+--------------------------------------------------------------------------------
+
+function WG.CEGForge.MouseWheel(up, value)
+if not forgeOpen then
+        return false
+    end
+
+    local mx, my = Spring.GetMouseState()
+    if mx < forgeX or mx > forgeX + forgeW
+    or my < forgeY or my > forgeY + forgeH then
+        return false
+    end
+
+    local _, ctrl = Spring.GetModKeyState()
+    local step = LINE_H * (ctrl and 3 or 1)
+
+    if up then
+        scrollY = scrollY - step
+    else
+        scrollY = scrollY + step
+    end
+
+    scrollY = math.max(0, math.min(maxScrollY, scrollY))
+    return true
+end
+
+
+--------------------------------------------------------------------------------
+-- Mouse input (Forge close button)
+--------------------------------------------------------------------------------
+
+function WG.CEGForge.MousePress(mx, my, button)
+if forgeOpen and button == 1 and forgeCloseBtn then
+        if mx >= forgeCloseBtn.x0 and mx <= forgeCloseBtn.x1
+        and my >= forgeCloseBtn.y0 and my <= forgeCloseBtn.y1 then
+            WG.CEGForge.Close()
+            return true
+        end
+    end
+    return false
+end
+end
+

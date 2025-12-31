@@ -1,5 +1,5 @@
 --------------------------------------------------------------------------------
--- CEG Preview (Synced Gadget) written by Steel
+-- CEG Preview (Synced Gadget) written by Steel December 2025
 --
 -- Overview:
 --   This gadget provides the synced execution layer for the CEG Browser UI.
@@ -16,8 +16,8 @@
 --     Projectile CEG Preview:
 --       - Spawns an invisible helper unit to emit test projectiles
 --       - Attaches selected CEGs as projectile trails
---       - Supports optional impact CEGs on ground collision
---       - Handles yaw, pitch, speed, gravity, and cleanup timing
+--       - Supports optional impact and muzzle flash CEGs
+--       - Handles yaw, pitch, speed, gravity, TTL, spawn offsets, airburst toggle, and cleanup timing
 --
 -- Message protocol:
 --   This gadget listens for the following LuaRules messages (protocol-stable):
@@ -28,7 +28,7 @@
 --
 -- Dependencies:
 --   - units/other/ceg_test_projectile.lua
---       Invisible helper unit used for projectile previews.
+--       Helper unit used for projectile previews.
 --       Carries a lightweight weapon definition for ballistic testing.
 --
 -- Notes:
@@ -44,6 +44,7 @@ function gadget:GetInfo()
         name    = "CEG Preview",
         desc    = "Synced execution for ground and projectile CEG preview",
         author  = "Steel",
+	date    = "December 2025",
         enabled = true,
         layer   = 0,
     }
@@ -60,6 +61,11 @@ end
 -- Engine refs
 --------------------------------------------------------------------------------
 local spSpawnCEG        = Spring.SpawnCEG
+
+-- TTL / Airburst (dummy-unit projectile) tracking
+local pendingShots = {}
+local liveProjectiles = {}
+local spDeleteProjectile = Spring.DeleteProjectile or Spring.DestroyProjectile
 local spGetGroundHeight = Spring.GetGroundHeight
 local spEcho            = Spring.Echo
 
@@ -86,7 +92,18 @@ local random = math.random
 --------------------------------------------------------------------------------
 local PREFIX_SINGLE = "cegtest:"
 local PREFIX_MULTI  = "cegtest_multi:"
+local PREFIX_GROUND = "ceg:"
 local PREFIX_PROJ   = "cegproj:"
+
+-- Resolve dummy weaponDefID (dummy unit fires the projectile)
+local dummyWeaponDefID
+do
+    local ud = UnitDefNames and UnitDefNames["ceg_test_projectile_unit"]
+    if ud and ud.weapons and ud.weapons[1] then
+        dummyWeaponDefID = ud.weapons[1].weaponDef
+    end
+end
+
 
 --------------------------------------------------------------------------------
 -- ============================================================================
@@ -167,6 +184,16 @@ local MAX_TRAIL_FRAMES   = 30 * 6
 
 local DEFAULT_GRAVITY = 0.16
 
+
+-- ============================================================================
+-- PROJECTILE ORIGIN OFFSETS (TWEAK THESE)
+-- ============================================================================
+-- Units: elmos
+-- Forward: pushes projectile + muzzle flash in front of the unit
+-- Up: lifts projectile + muzzle flash off the ground
+local PROJECTILE_FORWARD_OFFSET = 20
+local PROJECTILE_UP_OFFSET      = 20
+
 local cleanupQueue = {}
 local trails = {}
 local trailSeq = 0
@@ -178,7 +205,7 @@ local function Clamp(v, lo, hi)
     return v
 end
 
-local function FireCEGTestProjectile(ceg, impactBlock, x, z, yawDeg, pitchDeg, speed, gravity)
+local function FireCEGTestProjectile(ceg, impactBlock, muzzleBlock, x, z, yawDeg, pitchDeg, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
     x = tonumber(x)
     z = tonumber(z)
     if not x or not z then return end
@@ -189,13 +216,20 @@ local function FireCEGTestProjectile(ceg, impactBlock, x, z, yawDeg, pitchDeg, s
             impactCEGs[#impactCEGs+1] = n
         end
     end
+    local muzzleCEGs = {}
+    if muzzleBlock and muzzleBlock ~= "" then
+        for n in muzzleBlock:gmatch("([^,]+)") do
+            muzzleCEGs[#muzzleCEGs+1] = n
+        end
+    end
+
 
     yawDeg   = Clamp(tonumber(yawDeg)   or 0, -180, 180)
     pitchDeg = Clamp(tonumber(pitchDeg) or 0,  -89,  89)
     speed    = Clamp(tonumber(speed)    or 0,    0, 5000)
     gravity  = tonumber(gravity) or DEFAULT_GRAVITY
 
-    local y = (spGetGroundHeight(x, z) or 0) + SPAWN_LIFT
+    local baseY = (spGetGroundHeight(x, z) or 0) + SPAWN_LIFT
 
     local yaw   = DegToRad(yawDeg)
     local pitch = DegToRad(pitchDeg)
@@ -204,9 +238,31 @@ local function FireCEGTestProjectile(ceg, impactBlock, x, z, yawDeg, pitchDeg, s
     local dy = sin(pitch)
     local dz = cos(pitch) * sin(yaw)
 
+
+-- Apply forward + upward offsets so projectile origin matches muzzle flash origin
+local fwd = tonumber(fwdOfs) or 0
+    local up  = tonumber(upOfs)  or 0
+
+    -- Dummy unit spawns at mouse cursor (authoritative origin)
+    local unitX = x
+    local unitY = baseY
+    local unitZ = z
+
+    -- Projectile / muzzle origin (visual offset only)
+    local spawnX = unitX + dx * (PROJECTILE_FORWARD_OFFSET + fwd)
+    local spawnY = unitY + (PROJECTILE_UP_OFFSET + up)
+    local spawnZ = unitZ + dz * (PROJECTILE_FORWARD_OFFSET + fwd)
+
+    -- Optional muzzle flash CEG(s): spawned once at projectile origin
+    if muzzleCEGs and #muzzleCEGs > 0 then
+        for i = 1, #muzzleCEGs do
+            spSpawnCEG(muzzleCEGs[i], spawnX, spawnY, spawnZ, dx, dy, dz)
+        end
+    end
+
     local unitID = spCreateUnit(
         TEST_UNIT_NAME,
-        x, y, z,
+        unitX, unitY, unitZ,
         0,
         Spring.GetGaiaTeamID()
     )
@@ -224,9 +280,9 @@ local function FireCEGTestProjectile(ceg, impactBlock, x, z, yawDeg, pitchDeg, s
 
     local dist = math.max(256, speed * 2)
     spGiveOrderToUnit(unitID, CMD.ATTACK, {
-        x + dx * dist,
-        y + dy * dist,
-        z + dz * dist
+        spawnX + dx * dist,
+        spawnY + dy * dist,
+        spawnZ + dz * dist
     }, {})
 
     cleanupQueue[unitID] = spGetGameFrame() + CLEANUP_FRAMES
@@ -236,14 +292,15 @@ local function FireCEGTestProjectile(ceg, impactBlock, x, z, yawDeg, pitchDeg, s
         ceg   = ceg,
         impactCEGs = impactCEGs,
         gravity = gravity,
-        x     = x,
-        y     = y,
-        z     = z,
+        x     = spawnX,
+        y     = spawnY,
+        z     = spawnZ,
         vx    = dx * speed,
         vy    = dy * speed,
         vz    = dz * speed,
         nextF = spGetGameFrame(),
-        endF  = spGetGameFrame() + MAX_TRAIL_FRAMES,
+        endF  = spGetGameFrame() + (ttlFrames or MAX_TRAIL_FRAMES),
+        airburst = airburst,
     }
 end
 
@@ -259,6 +316,11 @@ function gadget:GameFrame(f)
 
     for id, t in pairs(trails) do
         if f >= t.endF then
+            if t.airburst and t.impactCEGs then
+                for i = 1, #t.impactCEGs do
+                    spSpawnCEG(t.impactCEGs[i], t.x, t.y, t.z, 0, 1, 0)
+                end
+            end
             trails[id] = nil
         else
             if f >= t.nextF then
@@ -282,6 +344,24 @@ function gadget:GameFrame(f)
             end
         end
     end
+    -- TTL / Airburst enforcement for engine projectiles spawned by dummy unit
+    for proID, data in pairs(liveProjectiles) do
+        if f >= data.expireFrame then
+            if data.airburst and data.impactCEGs and Spring.GetProjectilePosition then
+                local x, y, z = Spring.GetProjectilePosition(proID)
+                if x then
+                    for i = 1, #data.impactCEGs do
+                        spSpawnCEG(data.impactCEGs[i], x, y, z, 0, 1, 0)
+                    end
+                end
+            end
+            if spDeleteProjectile then
+                spDeleteProjectile(proID)
+            end
+            liveProjectiles[proID] = nil
+        end
+    end
+
 end
 
 --------------------------------------------------------------------------------
@@ -293,16 +373,68 @@ end
 function gadget:RecvLuaMsg(msg, playerID)
 
     -- PROJECTILE
-    if msg:sub(1, #PREFIX_PROJ) == PREFIX_PROJ then
-        local body = msg:sub(#PREFIX_PROJ + 1)
-        local cegBlock, xs, zs, yaw, pitch, speed, gravity =
-            body:match("^([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^:]+):([^:]+)$")
-        if not cegBlock then return end
+    if msg:sub(1, #PREFIX_PROJ) == PREFIX_PROJ or msg:sub(1, #PREFIX_GROUND) == PREFIX_GROUND then
+        local body = (msg:sub(1, #PREFIX_PROJ) == PREFIX_PROJ) and msg:sub(#PREFIX_PROJ + 1) or msg:sub(#PREFIX_GROUND + 1)
 
-        local trailCEG, impactBlock = cegBlock:match("^([^|]+)|?(.*)$")
-        if not trailCEG then return end
+        -- Optional suffixes: |ttl=seconds |airburst=0|1 |muzzle=...
+        local ttlFrames
+        local airburst = false
+        local muzzleBlock
 
-        FireCEGTestProjectile(trailCEG, impactBlock, xs, zs, yaw, pitch, speed, gravity)
+        local fwdOfs, upOfs
+        do
+            local tmp = body
+            while true do
+                local core, key, val = tmp:match("^(.-)|(%w+)=([^|]*)$")
+                if not core then break end
+                tmp = core
+                if key == "ttl" then
+                    local s = tonumber(val)
+                    if s then
+                        if s < 1 then s = 1 end
+                        if s > 30 then s = 30 end
+                        ttlFrames = math.floor(s * 30 + 0.5)
+                    end
+                elseif key == "airburst" then
+                    airburst = (val == "1")
+                elseif key == "ofs" then
+                    local a,b = val:match("([^,]+),([^,]+)")
+                    if a and b then
+                        fwdOfs = tonumber(a) or 0
+                        upOfs  = tonumber(b) or 0
+                    end
+                elseif key == "muzzle" then
+                    muzzleBlock = val
+                end
+            end
+            body = tmp
+        end
+        -- Robust parse: accept both formats
+        --   A) trail|impact:x:z:yaw:pitch:speed:gravity
+        --   B) trail:impact:x:z:yaw:pitch:speed:gravity
+        local parts = {}
+        for seg in body:gmatch("([^:]+)") do
+            parts[#parts+1] = seg
+        end
+
+        local trailCEG, impactBlock, xs, zs, yaw, pitch, speed, gravity
+
+        if #parts == 7 then
+            -- parts[1] = trail|impact  OR  trail
+            local cegBlock = parts[1]
+            trailCEG, impactBlock = cegBlock:match("^([^|]+)|?(.*)$")
+            xs, zs, yaw, pitch, speed, gravity = parts[2], parts[3], parts[4], parts[5], parts[6], parts[7]
+        elseif #parts == 8 then
+            -- parts[1]=trail, parts[2]=impact
+            trailCEG, impactBlock = parts[1], parts[2]
+            xs, zs, yaw, pitch, speed, gravity = parts[3], parts[4], parts[5], parts[6], parts[7], parts[8]
+        else
+            return
+        end
+
+        if not trailCEG or trailCEG == "" then return end
+
+        FireCEGTestProjectile(trailCEG, impactBlock, muzzleBlock, xs, zs, yaw, pitch, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
         return
     end
 
@@ -344,4 +476,21 @@ function gadget:RecvLuaMsg(msg, playerID)
         pat,
         tonumber(hs) or 0
     )
+end
+
+function gadget:Initialize()
+    if dummyWeaponDefID and Script and Script.SetWatchWeapon then
+        Script.SetWatchWeapon(dummyWeaponDefID, true)
+    end
+end
+
+function gadget:ProjectileCreated(proID, proOwnerID, weaponDefID)
+    if not dummyWeaponDefID or weaponDefID ~= dummyWeaponDefID then return end
+    local shot = table.remove(pendingShots, 1)
+    if not shot then return end
+    liveProjectiles[proID] = {
+        expireFrame = Spring.GetGameFrame() + (shot.ttlFrames or MAX_TRAIL_FRAMES),
+        airburst = shot.airburst,
+        impactCEGs = shot.impactCEGs,
+    }
 end

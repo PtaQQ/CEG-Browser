@@ -1,6 +1,7 @@
 # CEG Browser Widget for Beyond All Reason
 
-**Author:** Steel  
+**Author:** Steel
+**Date:** December 2025  
 **Type:** Developer / Artist Tool  
 **Status:** Developer environment only (not compatible with the standard public BAR release)
 
@@ -15,7 +16,7 @@ This tool is designed to support rapid iteration on visual effects by providing 
 
 ---
 
-## ⚠️ Important: Developer Environment Only
+## ⚠️ Important: Developer Environment Only ⚠️
 
 This widget **will NOT work** in the normal downloadable BAR game.
 
@@ -41,11 +42,15 @@ This tool is intended for:
 - Fires invisible test projectiles from the mouse ground position
 - Attaches selected CEGs as **projectile trails**
 - Optional **impact CEGs** per projectile
+- Optional **Muzzle flash CEGs** per projectile
 - Real-time tuning of:
   - Direction (yaw)
   - Pitch
   - Speed
   - Gravity
+  - Time to live
+  - Origin offset
+  - Airburst toggle (based on TTL)
 - Supports multi-select and batch firing
 
 ### Ground Preview Mode
@@ -66,18 +71,38 @@ This tool is intended for:
 - ALT + hover to reveal full CEG names
 - Clean separation between trail and impact selection
 
+
+### CEG INFO Panel
+
+- The CEG INFO panel is a lightweight inspection overlay embedded in the CEG Browser. It provides a read-only view of the currently -   selected CEG definition and CEG file location to assist with understanding complex effects.
+
+- Key Points
+- Opened and closed via the CEG INFO button
+- Displays definition data for the currently selected CEG and updates live as selections change
+- Mode-agnostic (works in PROJECTILE and GROUND modes)
+- UI-only and non-destructive
+- Does not affect selection, spawning, or preview behavior
+- The panel is intended as a supporting inspection tool and is not required for normal CEG browsing or preview workflows.
+
 ---
 
 ## Controls (Quick Reference)
 
-- **Left-click CEG**: Select as projectile trail
-- **Right-click CEG**: Select as projectile impact (PROJECTILE mode only)
+- **Left-click CEG**: Select as projectile Trail
+- **Right-click CEG**: Select as projectile Impact (PROJECTILE mode only)
+- **Middle-Mouse-click CEG**: Select as Muzzle Flash (PROJECTILE mode only)
 - **CTRL + click**: Multi-select
 - **CTRL + drag sliders**: Fine adjustments
 - **ALT + hover**: Show full CEG name tooltip
 - **Click outside window**:
   - Fire projectile (PROJECTILE mode, when armed)
   - Spawn ground CEGs (GROUND mode)
+
+---
+
+## Reload CEGs button will repopulate the ceg list as well as reload the ceg definitions (file must exist at game start).
+This allows for editing CEG files live, and seeing the changes after using the reload button without restarting 
+the game after each change.
 
 ---
 
@@ -108,7 +133,7 @@ units/other/ceg_test_projectile.lua (dummy projectile carrier unit)
   - Handles projectile physics, impact dispatch, and cleanup
 
 - **ceg_test_projectile.lua**
-  - Invisible, non-interactive helper unit
+  - Non-interactive helper unit
   - Exists only to legally emit test projectiles
   - Never selectable, controllable, or persistent
   - Safe for repeated spawning and cleanup
