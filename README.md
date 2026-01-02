@@ -106,13 +106,68 @@ the game after each change.
 
 ---
 
+### Sound Panel (Added January 1st 2026)
+
+-The **Sound Panel** is an auxiliary CEG Browser tool for **previewing and selecting audio** used with CEG spawns.
+
+**What it does**
+
+* Browse and search weapon sounds
+* Only looks in sound/weapons, sound/bombs, sounds/weapons-mult for weapon related sounds
+* Select:
+
+  * **Firing sound** (LMB, yellow highlight)
+  * **Impact sound** (RMB, red highlight)
+* Preview sounds instantly via **Play Firing Sound / Play Impact Sound** buttons
+* RESET clears selections; panel is closeable via **X**
+
+**Two sound paths (intentional)**
+
+* **UI Preview**
+
+  * Button-triggered
+  * Unsynced, local-only
+  * Does *not* spawn CEGs or projectiles
+
+* **World Playback**
+
+  * Triggered when spawning CEGs/projectiles
+  * Sound IDs are appended to spawn messages
+  * Gadget controls timing and world position
+
+**Widget ↔ Gadget contract**
+Sound selections are appended to spawn messages as optional suffixes:
+
+```
+|fireSound=<id>
+|impactSound=<id>
+```
+
+The gadget:
+
+* Parses these suffixes
+* Normalizes sound paths (`sounds/... .wav`)
+* Plays sounds at the correct world location and time
+
+**Design rules**
+
+* Widget = UI only (selection, preview, messaging)
+* Gadget = authoritative gameplay timing & world audio
+* No message formats were changed — sound support is additive
+* Preview audio is isolated from gameplay logic
+
+**Purpose**
+Speed up audio/visual iteration without touching weapon or unit defs.
+
+---
+
 ## File Structure & Dependencies
 
 This widget is **UI-only**, but it relies on the following additional runtime components:
 
 LuaUI/Widgets/gui_ceg_browser.lua (this widget)
 LuaRules/ceg_lookup.lua (CEG name discovery)
-LuaRules/Gadgets/game_ceg_preview.lua (synced CEG spawning logic)
+LuaRules/Gadgets/game_ceg_preview.lua (synced CEG spawning logic, unsynced sound effects)
 units/other/ceg_test_projectile.lua (dummy projectile carrier unit)
 
 
@@ -131,6 +186,7 @@ units/other/ceg_test_projectile.lua (dummy projectile carrier unit)
   - Synced gadget
   - Spawns test projectiles and ground CEGs
   - Handles projectile physics, impact dispatch, and cleanup
+  - Receives optional firing and impact sound IDs from the UI and triggers world-positioned audio playback in sync with CEG spawns
 
 - **units/other/ceg_test_projectile.lua**
   - Non-interactive helper unit

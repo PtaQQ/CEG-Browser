@@ -354,6 +354,127 @@ end
 -- Fire mode
 local fireArmed = false
 local groundArmed = false
+
+-- Aux panels (mutually exclusive): nil | "info" | "sound"
+local activeAuxPanel = nil
+
+--------------------------------------------------------------------------------
+
+-----------------------------------------------------------------
+-- UI-ONLY SOUND ENUMERATION (LuaUI; VFS)
+-----------------------------------------------------------------
+local function GetAllSoundsUI()
+    local sounds = {}
+    local seen = {}
+
+    local dirs = {
+        "sounds/weapons/",
+        "sounds/weapons-mult/",
+        "sounds/bombs/",
+    }
+
+    local exts = { [".ogg"]=true, [".wav"]=true }
+
+    -- Asset visibility can vary by environment; try multiple modes and union results.
+    local modes = { VFS.RAW, VFS.GAME, VFS.MOD, VFS.ZIP, VFS.MAP }
+
+    for _, base in ipairs(dirs) do
+        for _, mode in ipairs(modes) do
+            local files = VFS.DirList(base, "*", mode)
+            for _, path in ipairs(files or {}) do
+                local ext = path:match("%.[^%.]+$")
+                if ext then ext = ext:lower() end
+                if ext and exts[ext] then
+                    local name = path
+                        :gsub("^sounds/", "")
+                        :gsub("%.[^%.]+$", "")
+                    if not seen[name] then
+                        seen[name] = true
+                        sounds[#sounds + 1] = name
+                    end
+                end
+            end
+        end
+    end
+
+    table.sort(sounds)
+    return sounds
+end
+
+-- SOUND PANEL (Preview-only selector; isolated state)
+--------------------------------------------------------------------------------
+local SoundPanelState = {
+    -- window rect (set each DrawScreen when panel is drawn)
+    win = {x0=0,y0=0,x1=0,y1=0},
+    -- sound data (from ceg_lookup.lua)
+    sourceList = GetAllSoundsUI(),
+
+    filteredList = {},
+    searchText = "",
+    searchFocused = false,
+    letterFilter = nil, -- nil | 'a'..'z' (browser-style)
+    pageIndex = 0, -- 0-based like browser
+    itemsPerPage = 20,
+    selectedFireSound = nil,
+    selectedImpactSound = nil,
+    hitBoxes = {
+        rows = {},
+        search = nil,
+        pagerPrev = nil,
+        pagerNext = nil,
+        reset = nil,
+    },
+}
+
+local function SoundPanel_RebuildFiltered()
+    local q  = (SoundPanelState.searchText or ""):lower()
+    local lf = SoundPanelState.letterFilter -- nil or 'a'..'z'
+    local t  = {}
+
+    local function basename(s)
+        -- ignore everything before the last '/'
+        local b = s:match("([^/]+)$")
+        return b or s
+    end
+
+    for _, name in ipairs(SoundPanelState.sourceList or {}) do
+        if type(name) == "string" then
+            local ok = true
+            local base = basename(name):lower()
+
+            -- A–Z filter applies to basename, not path
+            if lf and lf ~= "" then
+                if string.sub(base, 1, 1) ~= lf then
+                    ok = false
+                end
+            end
+
+            -- search still matches full string (path-aware)
+            if ok and q ~= "" and not name:lower():find(q, 1, true) then
+                ok = false
+            end
+
+            if ok then
+                t[#t+1] = name
+            end
+        end
+    end
+
+    -- sort by basename first, full name second (stable, path-safe)
+    table.sort(t, function(a, b)
+        local ba = (a:match("([^/]+)$") or a):lower()
+        local bb = (b:match("([^/]+)$") or b):lower()
+        if ba == bb then
+            return a < b
+        end
+        return ba < bb
+    end)
+
+    SoundPanelState.filteredList = t
+end
+
+
+SoundPanel_RebuildFiltered()
 --------------------------------------------------------------------------------
 
 local CFG_WIN_X = "ceg_proj_preview_lua_win_x"
@@ -549,30 +670,44 @@ local function SpawnGroundCEGs()
     local height = math.floor(cegHeightOffset or 0)
 
     if #names == 1 then
-        -- SINGLE (new): cegtest:name:x:z:count:spacing:pattern:height
-        spSendLuaRulesMsg(
-            "cegtest:"
-            .. names[1]
-            .. ":" .. x
-            .. ":" .. z
-            .. ":" .. (cegSpawnCount or 1)
-            .. ":" .. (cegSpacing or 0)
-            .. ":" .. (cegPattern or "line")
-            .. ":" .. height
-        )
-    else
-        -- MULTI (new): cegtest_multi:name1,name2,...:x:z:count:spacing:pattern:height
-        spSendLuaRulesMsg(
-            "cegtest_multi:"
-            .. table.concat(names, ",")
-            .. ":" .. x
-            .. ":" .. z
-            .. ":" .. (cegSpawnCount or 1)
-            .. ":" .. (cegSpacing or 0)
-            .. ":" .. (cegPattern or "line")
-            .. ":" .. height
-        )
+    -- SINGLE (new): cegtest:name:x:z:count:spacing:pattern:height
+    local msg =
+        "cegtest:"
+        .. names[1]
+        .. ":" .. x
+        .. ":" .. z
+        .. ":" .. (cegSpawnCount or 1)
+        .. ":" .. (cegSpacing or 0)
+        .. ":" .. (cegPattern or "line")
+        .. ":" .. height
+
+    if SoundPanelState.selectedImpactSound then
+        msg = msg .. "|impactSound=" .. SoundPanelState.selectedImpactSound
     end
+
+    Spring.Echo("[CEG PREVIEW MSG][PROJECTILE]", msg)
+    Spring.Echo("[CEG PREVIEW MSG][GROUND]", msg)
+        spSendLuaRulesMsg(msg)
+
+else
+    -- MULTI (new): cegtest_multi:name1,name2,...:x:z:count:spacing:pattern:height
+    local msg =
+        "cegtest_multi:"
+        .. table.concat(names, ",")
+        .. ":" .. x
+        .. ":" .. z
+        .. ":" .. (cegSpawnCount or 1)
+        .. ":" .. (cegSpacing or 0)
+        .. ":" .. (cegPattern or "line")
+        .. ":" .. height
+
+    if SoundPanelState.selectedImpactSound then
+        msg = msg .. "|impactSound=" .. SoundPanelState.selectedImpactSound
+    end
+
+    spSendLuaRulesMsg(msg)
+end
+
 end
 -- synced gadget listens for this
 
@@ -659,6 +794,14 @@ local function FireSelectedProjectiles()
 
     if muzzleStr ~= "" then
         msg = msg .. "|muzzle=" .. muzzleStr
+    end
+
+        -- append selected sounds (baseline-safe)
+    if SoundPanelState.selectedFireSound then
+        msg = msg .. "|fireSound=" .. SoundPanelState.selectedFireSound
+    end
+    if SoundPanelState.selectedImpactSound then
+        msg = msg .. "|impactSound=" .. SoundPanelState.selectedImpactSound
     end
 
     msg = msg .. string.format("|ofs=%d,%d", math.floor(projectileForwardOffset or 0), math.floor(projectileUpOffset or 0))
@@ -917,10 +1060,25 @@ function widget:DrawScreen()
     DrawButton(
         c1x0, row4Y0, c1x1, row4Y1,
         "CEG INFO",
-        WG.CEGForge and WG.CEGForge.IsOpen and WG.CEGForge.IsOpen(),
+        activeAuxPanel == "info",
         false,
         theme.fontSize.button
     )
+
+    -- Row 4 (Sounds)
+    DrawButton(
+        c2x0, row4Y0, c2x1, row4Y1,
+        "SOUNDS",
+        activeAuxPanel == "sound",
+        false,
+        theme.fontSize.button
+    )
+    hitBoxes.topButtons.sounds = {
+        id = "sounds",
+        x0 = c2x0, y0 = row4Y0,
+        x1 = c2x1, y1 = row4Y1
+    }
+
     hitBoxes.topButtons.forge = {
         id = "forge",
         x0 = c1x0, y0 = row4Y0,
@@ -1414,8 +1572,336 @@ glText(string.format("Page %d / %d", curPage, totalPages),
     ----------------------------------------------------------------
     -- Forge panel overlay draw (mode-agnostic; always draw when open)
     ----------------------------------------------------------------
-    if WG.CEGForge and WG.CEGForge.Draw and WG.CEGForge.IsOpen and WG.CEGForge.IsOpen() then
+    if activeAuxPanel == "info" and WG.CEGForge and WG.CEGForge.Draw then
         WG.CEGForge.Draw()
+    end
+
+    ----------------------------------------------------------------
+    ----------------------------------------------------------------
+    -- Sound panel UI (stub list + isolated search/paging)
+    ----------------------------------------------------------------
+    local function DrawSoundPanelUI(sx0, sy0, sx1, sy1)
+        -- persist window rect for input routing
+        SoundPanelState.win.x0, SoundPanelState.win.y0 = sx0, sy0
+        SoundPanelState.win.x1, SoundPanelState.win.y1 = sx1, sy1
+
+        -- Window frame
+        glColor(theme.window.bg[1], theme.window.bg[2], theme.window.bg[3], theme.window.bg[4])
+        DrawRoundedRectFilled(sx0, sy0, sx1, sy1, CORNER_WINDOW_RADIUS)
+        glColor(theme.window.border[1], theme.window.border[2], theme.window.border[3], theme.window.border[4])
+        DrawRoundedRectFilled(sx0, sy0, sx1, sy1, CORNER_WINDOW_RADIUS)
+
+        local titleH = 28
+        glColor(theme.window.titleBg[1], theme.window.titleBg[2], theme.window.titleBg[3], theme.window.titleBg[4])
+        glRect(sx0 + CORNER_WINDOW_RADIUS, sy1 - titleH, sx1 - CORNER_WINDOW_RADIUS, sy1)
+        glColor(theme.window.titleText[1], theme.window.titleText[2], theme.window.titleText[3], theme.window.titleText[4])
+        glText("Sounds", sx0 + PADDING_OUTER, sy1 - titleH + 7, theme.fontSize.title, "o")
+
+
+        -- Close button (X) for Sounds panel (browser-identical)
+        local closeBtnW, closeBtnH = 20, 20
+        local closeX1 = sx1 - PADDING_OUTER
+        local closeX0 = closeX1 - closeBtnW
+        local closeY1 = sy1 - (titleH - closeBtnH) / 2
+        local closeY0 = closeY1 - closeBtnH
+
+        DrawButton(closeX0, closeY0, closeX1, closeY1, "X", false, false, theme.fontSize.small)
+        SoundPanelState.hitBoxes.close = {id="sound_close", x0=closeX0,y0=closeY0,x1=closeX1,y1=closeY1}
+
+        ----------------------------------------------------------------
+        -- Alphabet selector (browser-identical layout; SoundPanel-scoped)
+        ----------------------------------------------------------------
+        local alphaBtnH   = 20
+        local alphaPadY   = 4
+        local alphaPadX   = 3
+        local alphaPanelW = 210
+
+        SoundPanelState.hitBoxes.alphaButtons = {}
+
+        local yAlphaTop = sy1 - titleH - 8
+        local yCursor   = yAlphaTop
+
+        local alphaX0 = sx0 + PADDING_OUTER
+        local alphaX1 = alphaX0 + alphaPanelW
+
+
+        -- RESET button (Sound Panel): placed next to alphabet row (like browser Cheat button row)
+        -- Larger: spans the width of two standard browser buttons (cheat + globallos)
+        local resetBtnW = (80 * 2) + alphaPadX  -- 2 buttons + gap
+        local resetBtnH = alphaBtnH
+        local resetX0   = alphaX1 + 8
+        local resetY1   = yAlphaTop
+        local resetY0   = resetY1 - resetBtnH
+        local resetX1   = resetX0 + resetBtnW
+
+        DrawButton(resetX0, resetY0, resetX1, resetY1, "RESET", false, false, theme.fontSize.small)
+        SoundPanelState.hitBoxes.reset = {id="sound_reset", x0=resetX0,y0=resetY0,x1=resetX1,y1=resetY1}
+
+        -- Play sound buttons (Sounds panel) - disabled unless a sound is selected
+        local playGap = 4
+
+        -- Play Firing Sound (uses selectedFireSound, plays at muzzle/origin)
+        local fireSel = SoundPanelState.selectedFireSound
+        local fireY1  = resetY0 - playGap
+        local fireY0  = fireY1 - resetBtnH
+        
+        glColor(1.0, 0.9, 0.0, 1.0)
+        
+-- Play Firing Sound button (active when LMB sound selected)
+local fireActive = (SoundPanelState.selectedFireSound ~= nil)
+DrawButton(
+    resetX0, fireY0, resetX1, fireY1,
+    "Play Firing Sound",
+    fireActive,
+    not fireActive,
+    theme.fontSize.small
+)
+
+        glColor(1,1,1,1)
+    
+        if fireSel and fireSel ~= "" then
+            SoundPanelState.hitBoxes.playFire = {id="sound_play_fire", x0=resetX0,y0=fireY0,x1=resetX1,y1=fireY1}
+        else
+            SoundPanelState.hitBoxes.playFire = nil
+            glColor(0, 0, 0, 0.35)
+            glRect(Snap(resetX0), Snap(fireY0), Snap(resetX1), Snap(fireY1))
+        end
+
+        -- Play Impact Sound (uses selectedImpactSound, plays at last impact position)
+        local impactSel = SoundPanelState.selectedImpactSound
+        local impY1     = fireY0 - playGap
+        local impY0     = impY1 - resetBtnH
+        
+        glColor(1.0, 0.15, 0.15, 1.0)
+        
+-- Play Impact Sound button (active when RMB sound selected)
+local impactActive = (SoundPanelState.selectedImpactSound ~= nil)
+DrawButton(
+    resetX0, impY0, resetX1, impY1,
+    "Play Impact Sound",
+    impactActive,
+    not impactActive,
+    theme.fontSize.small
+)
+
+        glColor(1,1,1,1)
+    
+        if impactSel and impactSel ~= "" then
+            SoundPanelState.hitBoxes.playImpact = {id="sound_play_impact", x0=resetX0,y0=impY0,x1=resetX1,y1=impY1}
+        else
+            SoundPanelState.hitBoxes.playImpact = nil
+            glColor(0, 0, 0, 0.35)
+            glRect(Snap(resetX0), Snap(impY0), Snap(resetX1), Snap(impY1))
+        end
+
+
+        local letterFilter = SoundPanelState.letterFilter -- nil or lower-case 'a'..'z'
+        for _, row in ipairs(ALPHA_ROWS) do
+            local rowY1 = yCursor
+            local rowY0 = rowY1 - alphaBtnH
+            local colX  = alphaX0
+            for _, label in ipairs(row) do
+                local bw = (label == "All") and 30 or 20
+                local x2 = colX + bw
+                local active
+                if label == "All" then
+                    active = (not letterFilter)
+                else
+                    active = (letterFilter == string.lower(label))
+                end
+                DrawAlphaButton(colX, rowY0, x2, rowY1, label, active)
+                SoundPanelState.hitBoxes.alphaButtons[#SoundPanelState.hitBoxes.alphaButtons+1] = {
+                    id="sound_alpha_"..label, label=label,
+                    x0=colX, y0=rowY0, x1=x2, y1=rowY1
+                }
+                colX = x2 + alphaPadX
+            end
+            yCursor = rowY0 - alphaPadY
+        end
+        local alphaBottom = yCursor
+
+        ----------------------------------------------------------------
+        -- Search row (browser-identical layout; SoundPanel-scoped)
+        ----------------------------------------------------------------
+        local searchH  = 22
+        local searchW  = 260
+        local searchY1 = alphaBottom - 8
+        local searchY0 = searchY1 - searchH
+        local searchX0 = sx0 + PADDING_OUTER
+        local searchX1 = searchX0 + searchW
+
+        glColor(theme.search.bg[1], theme.search.bg[2], theme.search.bg[3], theme.search.bg[4])
+        DrawRoundedRectFilled(searchX0, searchY0, searchX1, searchY1, CORNER_BUTTON_RADIUS)
+        glColor(theme.search.border[1], theme.search.border[2], theme.search.border[3], theme.search.border[4])
+        DrawRoundedRectBorder(searchX0, searchY0, searchX1, searchY1, CORNER_BUTTON_RADIUS, 1)
+
+        local drawText = SoundPanelState.searchText or ""
+        local col = theme.search.text
+        if drawText == "" and not SoundPanelState.searchFocused then
+            drawText = ""
+            drawText = "search sound name..."
+            col = theme.search.hintText
+        end
+        glColor(col[1], col[2], col[3], col[4])
+        glText(drawText, Snap(searchX0 + 8), Snap(searchY0 + 4), theme.fontSize.normal, "o")
+
+        local clrW = 20
+        local clrX1 = searchX1 + clrW
+        local clrX0 = clrX1 - clrW
+        DrawButton(clrX0, searchY0, clrX1, searchY1, "x", false, false, theme.fontSize.normal)
+
+        SoundPanelState.hitBoxes.search      = {id="sound_search", x0=searchX0,y0=searchY0,x1=searchX1,y1=searchY1}
+        SoundPanelState.hitBoxes.searchClear = {id="sound_search_clear", x0=clrX0,y0=searchY0,x1=clrX1,y1=searchY1}
+
+        glColor(theme.text.dim[1], theme.text.dim[2], theme.text.dim[3], theme.text.dim[4])
+        glText(string.format("%d sounds (filtered)", #(SoundPanelState.filteredList or {})),
+               Snap(clrX1 + 8), Snap(searchY0 + 4), theme.fontSize.normal, "o")
+
+
+        ----------------------------------------------------------------
+        -- List area (two-column; CEG-identical)
+        ----------------------------------------------------------------
+        local footerH = 26
+        local pagerH  = 18
+        local pagerY0 = sy0 + (footerH - pagerH) * 0.5
+        local pagerY1 = pagerY0 + pagerH
+
+        local listY0 = pagerY1 + 8
+        local legendH = 22
+        local legendPad = 6
+
+        -- shrink list by one row so it does not intrude into legend padding
+local listY1 = searchY0 - 10 - legendH - legendPad - rowH
+        local rowH   = 22
+        local colPad = 6
+        local SOUND_GRID_COLS = 2
+
+        local rowsVisible = math.floor((listY1 - listY0) / rowH)
+        SoundPanelState.itemsPerPage = rowsVisible * SOUND_GRID_COLS
+
+        local listW = (sx1 - sx0) - PADDING_OUTER * 2
+        local colW  = (listW - colPad) / SOUND_GRID_COLS
+
+        
+        -- Sound selection legend (single-line, bottom-anchored like main browser)
+        -- place sound legend directly below the search bar, above the list
+local lgY = searchY0 - legendH - legendPad
+        local lgX = sx0 + PADDING_OUTER + 8
+        local fs  = theme.fontSize.normal + 1
+
+        -- Fire Sound (LMB)
+        glColor(1.0, 0.9, 0.0, 1.0)
+        glRect(lgX, lgY, lgX + 10, lgY + 10)
+        glColor(1,1,1,1)
+        local fireLabel = "Fire Sound (LMB)"
+        glText(fireLabel, Snap(lgX + 14), Snap(lgY - 1), fs, "o")
+
+        -- advance X by swatch + text width + padding
+        lgX = lgX + 14 + (glGetTextWidth(fireLabel) * fs) + 24
+
+        -- Impact Sound (RMB)
+        glColor(1.0, 0.15, 0.15, 1.0)
+        glRect(lgX, lgY, lgX + 10, lgY + 10)
+        glColor(1,1,1,1)
+        glText("Impact Sound (RMB)", Snap(lgX + 14), Snap(lgY - 1), fs, "o")
+
+local list  = SoundPanelState.filteredList or {}
+        local start = SoundPanelState.pageIndex * SoundPanelState.itemsPerPage + 1
+        local stop  = math.min(#list, start + SoundPanelState.itemsPerPage - 1)
+
+        SoundPanelState.hitBoxes.rows = {}
+
+        local idx = start
+        local baseY = listY1 - rowH
+
+        for row = 1, rowsVisible do
+            local y0 = baseY - (row - 1) * rowH
+            local y1 = y0 + rowH
+            if y0 < listY0 then break end
+
+            for col = 1, SOUND_GRID_COLS do
+                if idx > stop then break end
+                local name = list[idx]
+
+                local x0 = sx0 + PADDING_OUTER + (col - 1) * (colW + colPad)
+                local x1 = x0 + colW
+
+                SoundPanelState.hitBoxes.rows[#SoundPanelState.hitBoxes.rows + 1] = {
+                    id="sound_cell", name=name, x0=x0,y0=y0,x1=x1,y1=y1
+                }
+
+                -- base row background (CEG list style)
+                glColor(
+                    theme.list.rowBg[1],
+                    theme.list.rowBg[2],
+                    theme.list.rowBg[3],
+                    theme.list.rowBg[4]
+                )
+                glRect(Snap(x0), Snap(y0), Snap(x1), Snap(y1))
+
+                -- selection overlays
+                if name == SoundPanelState.selectedFireSound then
+                    -- Fire (LMB): bright unit-nameplate yellow
+                    glColor(1.0, 0.9, 0.0, 0.85)
+                    glRect(Snap(x0), Snap(y0), Snap(x1), Snap(y1))
+                elseif name == SoundPanelState.selectedImpactSound then
+                    -- Impact (RMB): bright unit-nameplate red
+                    glColor(1.0, 0.15, 0.15, 0.85)
+                    glRect(Snap(x0), Snap(y0), Snap(x1), Snap(y1))
+                end
+
+                glColor(theme.list.border[1], theme.list.border[2], theme.list.border[3], theme.list.border[4])
+                glRect(Snap(x0), Snap(y0), Snap(x1), Snap(y0 + 1))
+
+                local show = name
+                if #show > 28 then show = show:sub(1,26) .. "..." end
+                glColor(1,1,1,1)
+                glText(show, Snap(x0 + 6), Snap(y0 + 4), theme.fontSize.list, "o")
+
+                idx = idx + 1
+            end
+        end
+
+        ----------------------------------------------------------------
+        -- Pager (browser-style placement)
+        ----------------------------------------------------------------
+        local midX    = (sx0 + PADDING_OUTER + (sx1 - PADDING_OUTER)) * 0.5
+        local pPrevX0 = midX - 60
+        local pPrevX1 = pPrevX0 + 30
+        local pNextX1 = midX + 60
+        local pNextX0 = pNextX1 - 30
+
+        DrawButton(pPrevX0, pagerY0, pPrevX1, pagerY1, "<", false, false, theme.fontSize.normal)
+        DrawButton(pNextX0, pagerY0, pNextX1, pagerY1, ">", false, false, theme.fontSize.normal)
+        SoundPanelState.hitBoxes.pagerPrev = {id="sound_prev", x0=pPrevX0,y0=pagerY0,x1=pPrevX1,y1=pagerY1}
+        SoundPanelState.hitBoxes.pagerNext = {id="sound_next", x0=pNextX0,y0=pagerY0,x1=pNextX1,y1=pagerY1}
+
+        local totalPages = math.max(1, math.floor(((#(SoundPanelState.filteredList or {})) - 1)/SoundPanelState.itemsPerPage) + 1)
+        local curPage = math.min(totalPages, SoundPanelState.pageIndex + 1)
+        glColor(1,1,1,0.75)
+        glText(string.format("Page %d / %d", curPage, totalPages),
+               Snap(midX - 35), Snap(pagerY0 + 3), theme.fontSize.normal, "o")
+    end
+    ----------------------------------------------------------------
+    -- Sounds panel (stub UI; list/search isolated to SoundPanelState)
+    ----------------------------------------------------------------
+    if activeAuxPanel == "sound" then
+        local bx0, by0, bx1, by1
+        if WG.CEGBrowser and WG.CEGBrowser.GetPanelRect then
+            bx0, by0, bx1, by1 = WG.CEGBrowser.GetPanelRect()
+        end
+        if not bx0 then
+            bx0, by0, bx1, by1 = panelX, panelY, panelX + panelW, panelY + panelH
+        end
+
+        -- Sound panel size is self-contained (do NOT rely on forgeW/forgeH locals declared later)
+        local sw = 420
+        local sh = (by1 - by0)
+        local sx1 = bx0 - PADDING_OUTER
+        local sx0 = sx1 - sw
+        local sy0 = by0
+        local sy1 = by1
+DrawSoundPanelUI(sx0, sy0, sx1, sy1)
     end
 
 end
@@ -1425,9 +1911,120 @@ end
 --------------------------------------------------------------------------------
 
 function widget:MousePress(mx, my, button)
+
+        -- Close Sounds panel (X button)
+        if activeAuxPanel == "sound" then
+            local hb = SoundPanelState.hitBoxes.close
+            if hb and mx >= hb.x0 and mx <= hb.x1 and my >= hb.y0 and my <= hb.y1 then
+                activeAuxPanel = nil
+                SoundPanelState.searchFocused = false
+                SoundPanelState.letterFilter = nil
+                return true
+            end
+        end
+
     -- Forge module (CEG INFO panel) gets first right of refusal, even outside browser window
     if WG.CEGForge and WG.CEGForge.MousePress then
         if WG.CEGForge.MousePress(mx, my, button) then
+            return true
+        end
+    end
+
+
+    -- Sound panel gets first right of refusal when open (isolated input)
+    if activeAuxPanel == "sound" then
+        local w = SoundPanelState.win
+        if w and mx >= w.x0 and mx <= w.x1 and my >= w.y0 and my <= w.y1 then
+            -- reset button
+            local hb = SoundPanelState.hitBoxes
+            local reset = hb and hb.reset
+            if reset and mx>=reset.x0 and mx<=reset.x1 and my>=reset.y0 and my<=reset.y1 then
+                SoundPanelState.selectedFireSound   = nil
+                SoundPanelState.selectedImpactSound = nil
+                return true
+            end
+
+
+            -- play sound buttons (disabled unless a sound is selected)
+            local playFire = hb and hb.playFire
+            if playFire and mx>=playFire.x0 and mx<=playFire.x1 and my>=playFire.y0 and my<=playFire.y1 then
+                local s = SoundPanelState.selectedFireSound
+                if s and s ~= "" then
+                    Spring.SendLuaRulesMsg("ceg_preview_sound:" .. s)
+                end
+                return true
+            end
+            local playImpact = hb and hb.playImpact
+            if playImpact and mx>=playImpact.x0 and mx<=playImpact.x1 and my>=playImpact.y0 and my<=playImpact.y1 then
+                local s = SoundPanelState.selectedImpactSound
+                if s and s ~= "" then
+                    Spring.SendLuaRulesMsg("ceg_preview_sound:" .. s)
+                end
+                return true
+            end
+
+            -- alpha buttons (browser-identical; SoundPanel-scoped)
+            local abs = hb and hb.alphaButtons or {}
+            for _, ab in ipairs(abs) do
+                if mx>=ab.x0 and mx<=ab.x1 and my>=ab.y0 and my<=ab.y1 then
+                    if ab.label == "All" then
+                        SoundPanelState.letterFilter = nil
+                    else
+                        SoundPanelState.letterFilter = string.lower(ab.label)
+                    end
+                    SoundPanelState.pageIndex = 0
+                    SoundPanel_RebuildFiltered()
+                    return true
+                end
+            end
+
+            -- search clear
+            local sc = hb and hb.searchClear
+            if sc and mx>=sc.x0 and mx<=sc.x1 and my>=sc.y0 and my<=sc.y1 then
+                SoundPanelState.searchText = ""
+                SoundPanelState.pageIndex = 0
+                SoundPanel_RebuildFiltered()
+                return true
+            end
+
+            -- search focus
+            local s = hb and hb.search
+            if s and mx>=s.x0 and mx<=s.x1 and my>=s.y0 and my<=s.y1 then
+                SoundPanelState.searchFocused = true
+                -- unfocus browser search if any
+                searchFocused = false
+                return true
+            else
+                SoundPanelState.searchFocused = false
+            end
+
+            -- pager
+            local pprev = hb and hb.pagerPrev
+            local pnext = hb and hb.pagerNext
+            if pprev and mx>=pprev.x0 and mx<=pprev.x1 and my>=pprev.y0 and my<=pprev.y1 then
+                SoundPanelState.pageIndex = math.max(0, SoundPanelState.pageIndex - 1)
+                return true
+            end
+            if pnext and mx>=pnext.x0 and mx<=pnext.x1 and my>=pnext.y0 and my<=pnext.y1 then
+                local totalPages = math.max(1, math.floor(((#(SoundPanelState.filteredList or {})) - 1)/SoundPanelState.itemsPerPage) + 1)
+                SoundPanelState.pageIndex = math.min(totalPages-1, SoundPanelState.pageIndex + 1)
+                return true
+            end
+
+            -- row selection: LMB=fire, RMB=impact
+            local rows = hb and hb.rows or {}
+            for _, r in pairs(rows) do
+                if mx>=r.x0 and mx<=r.x1 and my>=r.y0 and my<=r.y1 then
+                    if button == 1 then
+                        SoundPanelState.selectedFireSound = r.name
+                    elseif button == 3 then
+                        SoundPanelState.selectedImpactSound = r.name
+                    end
+                    return true
+                end
+            end
+
+            -- consume clicks inside panel even if not on a control
             return true
         end
     end
@@ -1474,24 +2071,45 @@ function widget:MousePress(mx, my, button)
         local cheat    = topButtons.cheat
         local glob     = topButtons.glob
         local resetSel = topButtons.resetSel
+        -- Aux panel toggles (mutually exclusive)
+        local forge  = topButtons.forge
+        local sounds = topButtons.sounds
 
-	-- CEG Forge toggle
-	local forge = topButtons.forge
-	if forge
-   	   and mx >= forge.x0 and mx <= forge.x1
-   	   and my >= forge.y0 and my <= forge.y1
-	then
-    	if WG.CEGForge then
-            if WG.CEGForge.IsOpen and WG.CEGForge.IsOpen() then
-                WG.CEGForge.Close()
-            elseif WG.CEGForge.Open then
-                local srcFile = ResolveCEGSourceFile(lastSelected)
-		WG.CEGForge.Open(lastSelected, srcFile)
-            end
+        local function InBox(b)
+            return b and mx >= b.x0 and mx <= b.x1 and my >= b.y0 and my <= b.y1
         end
-        return true
-    end
 
+        -- CEG INFO (Forge) toggle
+        if InBox(forge) then
+            if activeAuxPanel == "info" then
+                activeAuxPanel = nil
+                if WG.CEGForge and WG.CEGForge.Close then
+                    WG.CEGForge.Close()
+                end
+            else
+                -- opening INFO closes SOUNDS
+                activeAuxPanel = "info"
+                if WG.CEGForge and WG.CEGForge.Open then
+                    local srcFile = ResolveCEGSourceFile(lastSelected)
+                    WG.CEGForge.Open(lastSelected, srcFile)
+                end
+            end
+            return true
+        end
+
+        -- SOUNDS toggle (placeholder)
+        if InBox(sounds) then
+            if activeAuxPanel == "sound" then
+                activeAuxPanel = nil
+            else
+                -- opening SOUNDS closes INFO
+                activeAuxPanel = "sound"
+                if WG.CEGForge and WG.CEGForge.Close then
+                    WG.CEGForge.Close()
+                end
+            end
+            return true
+        end
 
         if cheat and mx>=cheat.x0 and mx<=cheat.x1 and my>=cheat.y0 and my<=cheat.y1 then
             cheatOn = not cheatOn
@@ -2067,6 +2685,25 @@ function widget:KeyPress(key, mods, isRepeat)
         return true
     end
 
+
+    -- Sound panel search (isolated)
+    if activeAuxPanel == "sound" and SoundPanelState.searchFocused then
+        if key == 8 then -- backspace
+            if #SoundPanelState.searchText > 0 then
+                SoundPanelState.searchText = SoundPanelState.searchText:sub(1, #SoundPanelState.searchText - 1)
+                SoundPanel_RebuildFiltered()
+            end
+            return true
+        end
+        if key == 13 then -- enter
+            return true
+        end
+        if key == 27 then -- esc
+            SoundPanelState.searchFocused = false
+            return true
+        end
+    end
+
     if searchFocused then
         if key == 8 then -- backspace
             if #searchText > 0 then
@@ -2084,6 +2721,14 @@ function widget:KeyPress(key, mods, isRepeat)
 end
 
 function widget:TextInput(ch)
+    if activeAuxPanel == "sound" and SoundPanelState.searchFocused then
+        if not ch or ch == "" then return true end
+        if ch < " " then return true end
+        SoundPanelState.searchText = (SoundPanelState.searchText or "") .. ch
+        SoundPanel_RebuildFiltered()
+        return true
+    end
+
     if not searchFocused then
         return false
     end
@@ -2595,4 +3240,3 @@ if forgeOpen and button == 1 and forgeCloseBtn then
     return false
 end
 end
-

@@ -51,12 +51,9 @@ function gadget:GetInfo()
 end
 
 --------------------------------------------------------------------------------
--- SYNCED ONLY
+-- SYNCED / UNSYNCED SPLIT
 --------------------------------------------------------------------------------
-if not gadgetHandler:IsSyncedCode() then
-    return
-end
-
+if gadgetHandler:IsSyncedCode() then
 --------------------------------------------------------------------------------
 -- Engine refs
 --------------------------------------------------------------------------------
@@ -111,6 +108,8 @@ end
 -- ============================================================================
 --------------------------------------------------------------------------------
 
+local currentImpactSound
+
 local function SpawnCEG(name, x, z, height)
     if not name or name == "" then return end
     x = tonumber(x)
@@ -123,6 +122,9 @@ local function SpawnCEG(name, x, z, height)
     height = tonumber(height) or 0
     local y = (spGetGroundHeight(x, z) or 0) + height
     spSpawnCEG(name, x, y, z, 0, 1, 0, 0, 0)
+    if currentImpactSound then
+        SendToUnsynced("ceg_world_sound", currentImpactSound, x, y, z, 3.0)
+    end
 end
 
 local function SpawnCEGSet(names, x, z, height)
@@ -205,7 +207,7 @@ local function Clamp(v, lo, hi)
     return v
 end
 
-local function FireCEGTestProjectile(ceg, impactBlock, muzzleBlock, x, z, yawDeg, pitchDeg, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
+local function FireCEGTestProjectile(ceg, impactBlock, muzzleBlock, fireSound, impactSound, x, z, yawDeg, pitchDeg, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
     x = tonumber(x)
     z = tonumber(z)
     if not x or not z then return end
@@ -260,6 +262,11 @@ local fwd = tonumber(fwdOfs) or 0
         end
     end
 
+    -- Fire sound (once, at muzzle origin)
+    if fireSound then
+        SendToUnsynced("ceg_world_sound", fireSound, spawnX, spawnY, spawnZ, 3.0)
+    end
+
     local unitID = spCreateUnit(
         TEST_UNIT_NAME,
         unitX, unitY, unitZ,
@@ -291,6 +298,7 @@ local fwd = tonumber(fwdOfs) or 0
     trails[trailSeq] = {
         ceg   = ceg,
         impactCEGs = impactCEGs,
+        impactSound = impactSound,
         gravity = gravity,
         x     = spawnX,
         y     = spawnY,
@@ -316,9 +324,12 @@ function gadget:GameFrame(f)
 
     for id, t in pairs(trails) do
         if f >= t.endF then
-            if t.airburst and t.impactCEGs then
+            if t.airburst and t.impactCEGs and #t.impactCEGs > 0 then
                 for i = 1, #t.impactCEGs do
                     spSpawnCEG(t.impactCEGs[i], t.x, t.y, t.z, 0, 1, 0)
+                end
+                if t.impactSound then
+                    SendToUnsynced("ceg_world_sound", t.impactSound, t.x, t.y, t.z, 3.0)
                 end
             end
             trails[id] = nil
@@ -335,9 +346,12 @@ function gadget:GameFrame(f)
 
             local gy = spGetGroundHeight(t.x, t.z) or 0
             if t.y <= gy then
-                if t.impactCEGs then
+                if t.impactCEGs and #t.impactCEGs > 0 then
                     for i = 1, #t.impactCEGs do
                         spSpawnCEG(t.impactCEGs[i], t.x, gy, t.z, 0, 1, 0)
+                    end
+                    if t.impactSound then
+                        SendToUnsynced("ceg_world_sound", t.impactSound, t.x, gy, t.z, 3.0)
                     end
                 end
                 trails[id] = nil
@@ -372,6 +386,15 @@ end
 
 function gadget:RecvLuaMsg(msg, playerID)
 
+    -- UI-ONLY SOUND PREVIEW (no position, no mode dependency)
+    if msg:sub(1, 18) == "ceg_preview_sound:" then
+        local soundName = msg:sub(19)
+        if soundName and soundName ~= "" then
+            SendToUnsynced("ceg_preview_sound", soundName)
+        end
+        return
+    end
+
     -- PROJECTILE
     if msg:sub(1, #PREFIX_PROJ) == PREFIX_PROJ or msg:sub(1, #PREFIX_GROUND) == PREFIX_GROUND then
         local body = (msg:sub(1, #PREFIX_PROJ) == PREFIX_PROJ) and msg:sub(#PREFIX_PROJ + 1) or msg:sub(#PREFIX_GROUND + 1)
@@ -380,6 +403,8 @@ function gadget:RecvLuaMsg(msg, playerID)
         local ttlFrames
         local airburst = false
         local muzzleBlock
+        local fireSound
+        local impactSound
 
         local fwdOfs, upOfs
         do
@@ -405,6 +430,10 @@ function gadget:RecvLuaMsg(msg, playerID)
                     end
                 elseif key == "muzzle" then
                     muzzleBlock = val
+                elseif key == "fireSound" then
+                    fireSound = val
+                elseif key == "impactSound" then
+                    impactSound = val
                 end
             end
             body = tmp
@@ -434,7 +463,7 @@ function gadget:RecvLuaMsg(msg, playerID)
 
         if not trailCEG or trailCEG == "" then return end
 
-        FireCEGTestProjectile(trailCEG, impactBlock, muzzleBlock, xs, zs, yaw, pitch, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
+        FireCEGTestProjectile(trailCEG, impactBlock, muzzleBlock, fireSound, impactSound, xs, zs, yaw, pitch, speed, gravity, ttlFrames, airburst, fwdOfs, upOfs)
         return
     end
 
@@ -467,6 +496,23 @@ function gadget:RecvLuaMsg(msg, playerID)
         names[1] = nameField
     end
 
+    -- Parse optional suffixes appended to the height field (e.g. "12|impactSound=weapons/flakfire")
+    local height = 0
+    local groundImpactSound
+    if hs and hs ~= "" then
+        local tmp = hs
+        while true do
+            local core, key, val = tmp:match("^(.-)|(%w+)=([^|]*)$")
+            if not core then break end
+            tmp = core
+            if key == "impactSound" then
+                groundImpactSound = val
+            end
+        end
+        height = tonumber(tmp) or 0
+    end
+
+    currentImpactSound = groundImpactSound
     SpawnPattern(
         names,
         tonumber(xs),
@@ -474,7 +520,7 @@ function gadget:RecvLuaMsg(msg, playerID)
         tonumber(cs) or 1,
         tonumber(ss) or 0,
         pat,
-        tonumber(hs) or 0
+        height
     )
 end
 
@@ -494,3 +540,48 @@ function gadget:ProjectileCreated(proID, proOwnerID, weaponDefID)
         impactCEGs = shot.impactCEGs,
     }
 end
+
+--------------------------------------------------------------------------------
+-- UNSYNCED ONLY
+--------------------------------------------------------------------------------
+else
+
+-- Sound preview playback (UI channel)
+function gadget:Initialize()
+    gadgetHandler:AddSyncAction("ceg_preview_sound", function(_, soundName)
+        if not soundName or soundName == "" then return end
+
+        -- Normalize logical IDs like "weapons/flakfire" -> "sounds/weapons/flakfire.wav"
+        local p = soundName
+        if p:sub(1, 7) ~= "sounds/" then
+            p = "sounds/" .. p
+        end
+        if not p:find("%.[%a%d]+$") then
+            p = p .. ".wav"
+        end
+
+        Spring.PlaySoundFile(p, 1.0, "ui")
+    end)
+
+    gadgetHandler:AddSyncAction("ceg_world_sound", function(_, soundName, x, y, z, vol)
+        if not soundName or soundName == "" then return end
+        local v = tonumber(vol) or 1.0
+
+        -- Normalize logical IDs like "weapons/flakfire" -> "sounds/weapons/flakfire.wav"
+        local p = soundName
+        if p:sub(1, 7) ~= "sounds/" then
+            p = "sounds/" .. p
+        end
+        if not p:find("%.[%a%d]+$") then
+            p = p .. ".wav"
+        end
+
+        if x and y and z then
+            Spring.PlaySoundFile(p, v, "ui")
+        end
+    end)
+
+end
+
+end -- gadgetHandler:IsSyncedCode()
+
