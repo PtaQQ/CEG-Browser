@@ -106,7 +106,7 @@ the game after each change.
 
 ---
 
-### Sound Panel (Added January 1st 2026)
+## Sound Panel (Added January 1st 2026)
 
 -The **Sound Panel** is an auxiliary CEG Browser tool for **previewing and selecting audio** used with CEG spawns.
 
